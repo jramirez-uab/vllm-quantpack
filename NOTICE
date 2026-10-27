@@ -1,0 +1,25 @@
+vllm-quantpack
+Copyright 2026 Jorge Ramírez Espejo
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes code from OrcaSAQ2 (https://github.com/Continuum-AI-Corp/OrcaSAQ2-kernel, commit 7ddffb1),
+licensed under the Apache License, Version 2.0: the EXL3 quantization config, linear and embedding methods, the shard
+GEMM custom op and the embedding-layer constructor wrapper (vllm_quantpack/exl3/). Modified: prefix normalisation, empty
+draft heads, padding, dtype conversion, host-memory release, tensor parallelism, MoE dispatch.
+
+The Flint model (vllm_quantpack/families/flint/model.py) is adapted from vLLM's AfMoE model
+(https://github.com/vllm-project/vllm, Apache-2.0); its configuration class (config.py) comes from the SGLang serving kit
+published with RecursiveSI Flint (https://huggingface.co/RecursiveSI, Apache-2.0).
+
+The quantized-embedding support for Qwen3.5-family GPTQ checkpoints (vllm_quantpack/families/qwen.py and
+vllm_quantpack/exl3/layers.py) replaces, without modifying vLLM, qwen3_5-embed-quant.patch from
+syv-ai/qwen38-27b-rtx3090 (https://github.com/syv-ai/qwen38-27b-rtx3090, Apache-2.0).
+
+The EXL3 format and its CUDA kernels come from exllamav3 (https://github.com/turboderp-org/exllamav3, MIT), which is a
+runtime dependency and is not included here. EXL3 is a streamlined variant of QTIP (https://github.com/Cornell-RelaxML/qtip).
+
+Developed with the support of the Department of Computer Science (Departament de Ciències de la Computació),
+Universitat Autònoma de Barcelona, which provided the hardware used to build and measure it.
+
+This repository contains no model weights.

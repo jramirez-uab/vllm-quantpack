@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-quantpack"
+version = "0.1.0"
+description = "vLLM plugin: serve EXL3 (exllamav3 trellis) checkpoints and the model-family fixes they need, with no patch to vLLM"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+readme = "README.md"
+authors = [{ name = "Jorge Ramírez Espejo" }]
+classifiers = ["Development Status :: 3 - Alpha"]
+# vLLM, torch and exllamav3 are deliberately not pinned: exllamav3's wheel is ABI-linked to torch and the CUDA major
+# version and is published as a GitHub release asset, not on PyPI. See README.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/jramirez-uab/vllm-quantpack"
+
+[project.entry-points."vllm.general_plugins"]
+quantpack = "vllm_quantpack:register"
+
+[tool.setuptools.packages.find]
+include = ["vllm_quantpack*"]
