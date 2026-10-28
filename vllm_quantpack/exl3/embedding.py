@@ -2,8 +2,9 @@
 
 exllamav3 refuses to quantize embed_tokens and keeps it in system RAM, so its native engine never pays VRAM for it. vLLM
 does: VocabParallelEmbedding is a GPU tensor (2.54 GB in bf16 for a 248,320-token vocabulary). Our packs store it as
-int8 rows with a per-row scale (scripts/embed_int8.py in each repo), dequantized on the GATHERED rows so the table itself
-stays int8; the ablation measured that as free (KLD 0.0338 against 0.0341 for bf16).
+int8 rows with a per-row scale (scripts/embed_int8.py in each repo; the ablation measured that as free, KLD 0.0338
+against 0.0341 for bf16) or as int4 with one scale per 128 columns (tools/embed_quant.py --bits 4), dequantized on the
+GATHERED rows so the table itself stays quantized (formats: embed_codec.py).
 
 Origin: OrcaSAQ2 heads.py (Apache-2.0) with the published patch (empty draft table), plus the TP cut and host release
 qwen38_exl3_vision 0.4.1 added: each rank keeps its own vocabulary rows (VocabParallelEmbedding masks the ids and
@@ -12,13 +13,14 @@ all-reduces).
 import torch
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 
+from .embed_codec import dequantize, gather
 from .linear import Exl3ShardParam, release
 
 EMBED_SUFFIXES = ("qweight", "scales", "weight")
 
 
 class Exl3EmbeddingMethod(QuantizeMethodBase):
-    """int8 rows with a per-row scale, or a dense table, whichever the pack carries."""
+    """int8 rows with a per-row scale, int4 with per-group scales, or a dense table, whichever the pack carries."""
 
     def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
                        input_size, output_size, params_dtype, **extra_weight_attrs):
@@ -50,23 +52,23 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         if s is None:
             raise RuntimeError("embed_tokens: qweight without scales")
         layer.exl3_embed_q = torch.nn.Parameter(q.to(dev), requires_grad=False)
-        layer.exl3_embed_s = torch.nn.Parameter(s.to(dev, layer.exl3_params_dtype).reshape(-1, 1), requires_grad=False)
+        layer.exl3_embed_s = torch.nn.Parameter(s.to(dev, layer.exl3_params_dtype).reshape(s.shape[0], -1),
+                                                requires_grad=False)
 
     def embedding(self, layer, input_: torch.Tensor) -> torch.Tensor:
         if layer.exl3_embed_q is None and layer.exl3_embed is None:
             raise RuntimeError("embed_tokens: empty table (a draft whose embeddings were not shared with the target)")
         if layer.exl3_embed_q is None:
             return layer.exl3_embed[input_]
-        # Index directly rather than through F.embedding: the table is int8, and the scale is applied to the gathered
-        # rows so the table itself is never materialised in bf16.
-        rows = layer.exl3_embed_q[input_].to(layer.exl3_embed_s.dtype)
-        return rows * layer.exl3_embed_s[input_]
+        # Index directly rather than through F.embedding: the table is int8/int4, and the scales are applied to the
+        # gathered rows so the table itself is never materialised in bf16.
+        return gather(layer.exl3_embed_q, layer.exl3_embed_s, input_, layer.exl3_embed_s.dtype)
 
     def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.exl3_embed_q is None:
             w = layer.exl3_embed
         else:
-            w = layer.exl3_embed_q.to(x.dtype) * layer.exl3_embed_s
+            w = dequantize(layer.exl3_embed_q, layer.exl3_embed_s, x.dtype)
         out = torch.nn.functional.linear(x, w.to(x.dtype))
         return out + bias if bias is not None else out
 
