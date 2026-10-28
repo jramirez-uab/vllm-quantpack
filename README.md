@@ -18,12 +18,27 @@ model-family fixes they need, in stock vLLM: no patch to vLLM, no per-model plug
 ## Requirements
 
 - vLLM 0.31 (0.30 also works).
-- The exllamav3 wheel that matches your torch and CUDA. It is not on PyPI:
+- exllamav3 1.6.5, as the prebuilt wheel that matches your torch and CUDA. The prebuilt wheels are on the
+  [exllamav3 releases](https://github.com/turboderp-org/exllamav3/releases) page; PyPI only has a generic wheel that
+  compiles the CUDA kernels on first use (it needs a CUDA toolkit and takes a while). For vLLM 0.31 (torch 2.13.0, CUDA 13):
   ```
-  python -c "import torch; print(torch.__version__, torch.version.cuda)"
-  # then pick the matching asset from https://github.com/turboderp-org/exllamav3/releases
+  W=exllamav3-1.6.5+cu132.torch2.13.0-cp312-cp312-linux_x86_64.whl
+  curl -L -o /tmp/$W "https://github.com/turboderp-org/exllamav3/releases/download/v1.6.5/${W/+/%2B}"
+  pip install /tmp/$W
   ```
+  For other versions: `python -c "import torch; print(torch.__version__, torch.version.cuda)"` and pick the matching asset.
 - An NVIDIA GPU of compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell).
+- FlashInfer's prebuilt kernels in the same environment, unless you have a CUDA toolkit: without them vLLM looks for
+  `nvcc` at start and fails with `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`. For vLLM 0.31:
+  ```
+  pip install flashinfer-cubin==0.7.0.post1 flashinfer-jit-cache==0.7.0.post1+cu130 \
+    --extra-index-url https://flashinfer.ai/whl/ --extra-index-url https://flashinfer.ai/whl/cu130/
+  ```
+- The Python headers and a C compiler (`sudo apt-get install python3.12-dev build-essential` on Debian/Ubuntu). Triton
+  compiles a small C helper every time vLLM starts; with a system Python and no headers it stops with
+  `fatal error: Python.h: No such file or directory`.
+
+Each model card on Hugging Face has the full install block that was tested for that checkpoint.
 
 ## Install
 
@@ -46,7 +61,7 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 | GPTQ with int4/int8 embeddings (Qwen3.5 family, vLLM <= 0.31) | validated: loads on unpatched vLLM 0.31, bit-identical to the patched vLLM in eager mode |
 | Spark architecture | served (Spark-X2.5 4B) |
 | Nemotron-3.5-Super-VL (gateless ReLU² MoE, MTP, vision) | served (2.25 bpw, one 96 GB GPU) |
-| Every published JRamirez-UAB checkpoint | each served with its card's Quick start command on a clean vLLM 0.31 install: text, image and tool call answered |
+| Every published JRamirez-UAB checkpoint | each served with its card's Quick start command on a clean vLLM 0.31 + exllamav3 1.5.1 install: text, image and tool call answered |
 
 ## Credits
 
