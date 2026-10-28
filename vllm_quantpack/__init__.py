@@ -11,7 +11,7 @@ Layout:
 It replaces OrcaSAQ2 (whose code it includes, Apache-2.0), qwen38_exl3_vision, flint_vllm and spark_vllm, which must
 not be installed alongside.
 """
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Entry-point names of the plugins this package replaces.
 _CONFLICTS = ("orcasaq2", "qwen38_exl3_vision", "tarninfer_exl3", "flint_vllm", "spark_vllm")
