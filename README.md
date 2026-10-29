@@ -55,8 +55,12 @@ Options (environment variables of the vLLM process):
 
 The defaults come from an A40 (84 SMs) and an RTX PRO 6000 (188 SMs). On another GPU, measure with
 `bench_int4_attn.py` from the validation suite (`MODE=decode` for decode tiles and segments, `MODE=fa` for prefill) and
-set the variables. The first long request after a fresh install compiles the new kernels (tens of seconds); Triton
-caches them on disk for later starts.
+set the variables.
+
+On Blackwell (RTX 50xx, RTX PRO 6000), vLLM 0.31's FlashAttention 2 build carries sm_80 code only, so the driver
+compiles it for the GPU on its first use: the first long prefill takes ~30 s more. The driver keeps the result in
+`~/.nv/ComputeCache`; a service without `HOME` (a systemd unit, for example) loses it and pays it at every start, so
+give it `HOME` or `CUDA_CACHE_PATH`. Ampere and Ada run the sm_80 code directly.
 
 ## Requirements
 
