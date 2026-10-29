@@ -8,7 +8,8 @@ model-family fixes they need, in stock vLLM: no patch to vLLM, no per-model plug
 - Registers `quant_method: "exl3"`, so `vllm serve <repo>` loads EXL3 packs with no extra flag:
   - linear layers at any per-tensor bitrate, including fused layers whose shards have different bitrates;
   - `lm_head` as an EXL3 tensor (`head_bits`) or dense;
-  - `embed_tokens` as int8 rows with a per-row scale, dequantized on the gathered rows;
+  - `embed_tokens` as int8 rows with a per-row scale, or int4 with a scale per group of 128 columns, dequantized on the gathered rows
+    (convert a pack's bf16 table with `python -m vllm_quantpack.tools.embed_quant SRC DST --bits {4,8}`);
   - routed MoE experts on exllamav3's fused kernel, capturable in CUDA graphs;
   - tensor parallelism for dense layers (`-tp N`) and expert parallelism for MoE (`-tp N --enable-expert-parallel`).
 - Model-family fixes:
@@ -54,6 +55,7 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 | Part | State |
 |---|---|
 | EXL3 linear, int8 embedding, lm_head | validated: same scores as the previous stack (dense Qwen 27B) |
+| EXL3 int4 embedding | validated (dense Qwen 27B): KLD +0.16 % vs bf16 table, tool calls and agent tasks unchanged |
 | EXL3 MoE | validated on one GPU (Groot 19B-A3B): same as the previous stack within run-to-run noise |
 | Tensor / expert parallelism | validated with MoE TP2 + EP (Groot 19B-A3B); Flash-Next TP not tested yet |
 | Qwen vision, Flash-Next PLE | validated (Kestrel, Groot, Flash-Next 2.25) |
