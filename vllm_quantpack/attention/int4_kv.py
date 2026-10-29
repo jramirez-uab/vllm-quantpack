@@ -2,7 +2,7 @@
 
 vLLM 0.31's packed INT4 read kernel (`_attn_packed` in v1/attention/ops/int4_per_token_head.py) has three problems,
 measured on an A40 and an RTX PRO 6000 Blackwell with Qwen3.8-27B shapes (24 query / 4 KV heads, head 256) against
-an fp64 reference computed from the same cache (bateria-llm/sueltos/bench_int4_attn.py):
+an fp64 reference computed from the same cache (python -m vllm_quantpack.tools.int4_kv_bench):
 
 1. Wrong output at long context. Its dots run on fp32 operands, which Triton rounds to TF32, but the value
    zero-point correction `sum(P * v_scale * v_zp)` uses the unrounded P. The rounding error times the zero point
@@ -35,7 +35,7 @@ import textwrap
 MODULE = "vllm.v1.attention.ops.int4_per_token_head"
 MAX_Q_SPLIT_KV = 4               # MTP / EAGLE verification with up to 3 draft tokens
 # Triton prefill tiles (BLOCK_M, TILE_SIZE, num_warps, num_stages) by compute-capability major, from
-# bench_int4_attn.py. Ampere/Ada (8.x): A40. Consumer Blackwell (12.x): RTX PRO 6000 Server, to be confirmed on an
+# int4_kv_bench. Ampere/Ada (8.x): A40. Consumer Blackwell (12.x): RTX PRO 6000 Server, to be confirmed on an
 # RTX 5060 Ti (36 SMs instead of 188). VLLM_QUANTPACK_INT4_TILES="64,64,8,2" overrides.
 PREFILL_TILES_BY_MAJOR = {8: (64, 64, 8, 2), 12: (64, 64, 8, 2)}
 PREFILL_TILES_DEFAULT = (64, 64, 8, 2)

@@ -53,9 +53,16 @@ Options (environment variables of the vLLM process):
 | `VLLM_QUANTPACK_INT4_TILES` | `64,64,8,2` | Triton prefill `BLOCK_M,TILE,warps,stages` (short chunks, or with FlashAttention prefill off) |
 | `VLLM_QUANTPACK_CACHE` | `~/.cache/vllm-quantpack` | where the generated kernel module is written (Triton needs it on disk) |
 
-The defaults come from an A40 (84 SMs) and an RTX PRO 6000 (188 SMs). On another GPU, measure with
-`bench_int4_attn.py` from the validation suite (`MODE=decode` for decode tiles and segments, `MODE=fa` for prefill) and
-set the variables.
+The defaults come from an A40 (84 SMs) and an RTX PRO 6000 (188 SMs). On another GPU, time the options on it:
+
+```
+python -m vllm_quantpack.tools.int4_kv_bench --contexts 32768,131072,262144
+```
+
+It fills a random int4 cache and prints, per attention layer, vLLM's stock decode and each split-KV decode config
+(`--decode 64,4,16:64,4,32:...`), and a prefill chunk on Triton and on FlashAttention, each with its relative error
+against an fp64 reference. The model shape defaults to Qwen3.8-27B (`--q-heads`, `--kv-heads`, `--head-size`,
+`--block-size`, `--mtp` change it). Then set `VLLM_QUANTPACK_INT4_DECODE` to the fastest config.
 
 On Blackwell (RTX 50xx, RTX PRO 6000), vLLM 0.31's FlashAttention 2 build carries sm_80 code only, so the driver
 compiles it for the GPU on its first use: the first long prefill takes ~30 s more. The driver keeps the result in
@@ -102,6 +109,7 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 |---|---|
 | EXL3 linear, int8 embedding, lm_head | validated: same scores as the previous stack (dense Qwen 27B) |
 | EXL3 int4 embedding | validated (dense Qwen 27B): KLD +0.16 % vs bf16 table, tool calls and agent tasks unchanged |
+| int4 KV cache attention (`int4_per_token_head`) | validated (Swift-1.5 27B 2.25 bpw on an A40 limited to 16 GB, 262,144 tokens, MTP 1): tool calls 30/30, agent tasks 10/10, 9/10, 10/10; speed above, A40 and RTX PRO 6000 |
 | EXL3 MoE | validated on one GPU (Groot 19B-A3B): same as the previous stack within run-to-run noise |
 | Tensor / expert parallelism | validated with MoE TP2 + EP (Groot 19B-A3B); Flash-Next TP not tested yet |
 | Qwen vision, Flash-Next PLE | validated (Kestrel, Groot, Flash-Next 2.25) |

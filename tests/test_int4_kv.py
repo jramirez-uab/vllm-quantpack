@@ -198,3 +198,11 @@ def test_mixed_batch_long_prefill_and_mtp_decode(int4_module):
     out = _attend(m, [q0, q1], cache, [(0, b0, n0), (b0, b1, n1)], int4_kv.decode_tiles(torch.cuda.get_device_properties(0).multi_processor_count)[2])
     assert _relerr(out[:256], _reference(m, q0, cache, 0, n0)) < 1e-2
     assert _relerr(out[256:], _reference(m, q1, cache, b0, n1)) < 1e-2
+
+
+def test_bench_tool_help(capsys):
+    from vllm_quantpack.tools import int4_kv_bench
+    with pytest.raises(SystemExit) as e:
+        int4_kv_bench.main(["--help"])
+    assert e.value.code == 0
+    assert "VLLM_QUANTPACK_INT4_DECODE" in capsys.readouterr().out
