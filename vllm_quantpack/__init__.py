@@ -48,9 +48,11 @@ def register():
         return  # already registered in this process
     patch_embedding_layers(logger)
 
+    from .attention.int4_kv import patch_int4_kv
     from .exl3.spec_decode import patch_should_share
     from .families import flint, nemotron, qwen, spark
     patch_should_share(logger)
+    patch_int4_kv(logger)
     qwen.register(logger)
     if flint.register(logger):
         logger.info("vllm-quantpack: Flint model registered")
