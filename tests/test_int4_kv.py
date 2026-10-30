@@ -200,6 +200,30 @@ def test_mixed_batch_long_prefill_and_mtp_decode(int4_module):
     assert _relerr(out[256:], _reference(m, q1, cache, b0, n1)) < 1e-2
 
 
+@gpu
+def test_long_prefill_does_not_wait_for_the_gpu(int4_module):
+    """prefill_sequence loops over 16k segments per layer; a host-to-GPU copy per segment stalled the engine loop."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    from vllm_quantpack.attention import int4_prefill
+    m = int4_module
+    n = 40000
+    nb = (n + BS - 1) // BS
+    cache = _cache(m, nb)
+    _fill(m, cache, 0, n, 0)
+    kc, vc, ks, vs = cache
+    q = torch.randn((256, NQ, HS), device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(nb, dtype=torch.int32, device="cuda")
+    q_rot = m.single_rht(q.float()).to(q.dtype)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        o = int4_prefill.prefill_sequence(q_rot, kc, vc, ks, vs, table, n, HS ** -0.5 / HS, flash_attn_varlen_func)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    out = (m.single_rht(o.float(), inverse=True) / HS).double()
+    assert _relerr(out, _reference(m, q, cache, 0, n)) < 1e-2
+
+
 def test_bench_tool_help(capsys):
     from vllm_quantpack.tools import int4_kv_bench
     with pytest.raises(SystemExit) as e:

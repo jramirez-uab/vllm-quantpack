@@ -57,6 +57,14 @@ def unpack_segment(cache, scales, block_row, start, length, out):
         out.stride(0), out.stride(1), BLOCK_SIZE=cache.shape[1], HALF=half, TOKENS=tokens)
 
 
+def _cu_seqlens(length, device):
+    """[0, length] as int32 on the GPU, written by kernels: torch.tensor([0, length], device=...) copies from host
+    memory and makes the CPU wait for every queued kernel, once per segment of every layer."""
+    cu = torch.full((2,), length, dtype=torch.int32, device=device)     # fill kernels: no copy from the host
+    cu[0].zero_()
+    return cu
+
+
 def prefill_sequence(q_rot, k_cache, v_cache, k_scales, v_scales, block_row, n, softmax_scale, fa):
     """Attention of q_rot (the chunk's queries, already RHT-rotated, the last len(q_rot) positions of a context of
     n tokens) over the whole cached context. Returns the output in the RHT domain, in q_rot's dtype."""
@@ -65,7 +73,8 @@ def prefill_sequence(q_rot, k_cache, v_cache, k_scales, v_scales, block_row, n, 
     seg = min(SEGMENT, n)
     kbuf = torch.empty((seg, nkv, hs), dtype=q_rot.dtype, device=q_rot.device)
     vbuf = torch.empty_like(kbuf)
-    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device=q_rot.device)
+    cu_q = _cu_seqlens(qlen, q_rot.device)
+    cu_full = _cu_seqlens(seg, q_rot.device)      # every segment but the oldest is SEGMENT tokens long
     acc = acc_lse = None               # fp32 output (tokens, heads, head size) and log-sum-exp (heads, tokens)
     end = n
     while end > 0:                     # newest segment first: it is the causal one and holds the chunk's own keys
@@ -74,7 +83,7 @@ def prefill_sequence(q_rot, k_cache, v_cache, k_scales, v_scales, block_row, n, 
         unpack_segment(k_cache, k_scales, block_row, start, length, kbuf)
         unpack_segment(v_cache, v_scales, block_row, start, length, vbuf)
         o, lse = fa(q_rot, kbuf[:length], vbuf[:length], max_seqlen_q=qlen, cu_seqlens_q=cu_q, max_seqlen_k=length,
-                    cu_seqlens_k=torch.tensor([0, length], dtype=torch.int32, device=q_rot.device),
+                    cu_seqlens_k=cu_full if length == seg else _cu_seqlens(length, q_rot.device),
                     softmax_scale=softmax_scale, causal=end == n, return_softmax_lse=True, fa_version=2)
         lse = lse.float()
         if acc is None:
