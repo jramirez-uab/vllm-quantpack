@@ -7,8 +7,15 @@ through the pointer tables it expects:
 
   * few assignments (decode, MTP verification; T <= kernel rows): everything runs in `ext.exl3_moe`, with no CPU
     synchronisation -> capturable in CUDA graphs;
-  * prefill: experts with few rows still use the fused kernel; heavily loaded experts are computed by reconstructing
-    their weights (`quantpack::exl3_gemm`, which above 144 rows reconstructs and uses a dense GEMM).
+  * prefill (default, VLLM_QUANTPACK_MOE_VIRTUAL=1): every expert is cut on the GPU into "virtual experts" of at most
+    `fused_rows` rows that point to the same weights, and the fused kernel runs once per row tier (16-row tiles below 64
+    rows, 64-row tiles above with the mul1 codebook). The kernel finds each expert's rows by summing the counts and
+    indexes the pointer tables by expert, so repeated pointers are fine, and it adds its outputs atomically. Nothing is
+    read on the CPU: before, `count.tolist()` stopped the engine loop at every MoE layer of every prefill chunk and a
+    Python loop launched ~6 kernels per heavily loaded expert;
+  * prefill with VLLM_QUANTPACK_MOE_VIRTUAL=0: experts with few rows use the fused kernel; heavily loaded experts are
+    computed by reconstructing their weights (`quantpack::exl3_gemm`, which above 144 rows reconstructs and uses a
+    dense GEMM).
 
 Compute is fp16 (as in exllamav3) and the expert sum is fp32. Tensor parallelism needs expert parallelism
 (`-tp N --enable-expert-parallel`): each GPU keeps whole experts and the kernel is unchanged.
@@ -117,6 +124,32 @@ class _Experts:
                      g.mcg, g.mul1, u.mcg, u.mul1, d.mcg, d.mul1,
                      0.0, num_active, None, None, lo, hi, 16)
 
+    def fused_virtual(self, y, out, count, tok_sorted, w_sorted, T, k):
+        """Prefill without CPU sync: cut each expert into chunks of <= fused_rows rows (virtual experts with the
+        same weight pointers) and run the fused kernel over them. Every size is fixed by T, k and E."""
+        from exllamav3.ext import exllamav3_ext as ext
+        R, E, dev = self.fused_rows, self.E, y.device
+        V = E + (T * k + R - 1) // R                     # upper bound of sum(ceil(count_e / R)) over experts
+        cnt = count[:E]
+        chunks = (cnt + R - 1) // R
+        ends = chunks.cumsum(0)
+        v = torch.arange(V, device=dev)
+        owner = torch.searchsorted(ends, v, right=True)  # E for the unused tail
+        valid = owner < E
+        e = owner.clamp(max=E - 1)
+        j = v - (ends[e] - chunks[e])                    # chunk index inside its expert
+        vcount = torch.where(valid, (cnt[e] - j * R).clamp(0, R), torch.zeros_like(v))
+        vcount = torch.cat((vcount, count[E:]))          # the kernel ignores the last bin (sentinel bucket)
+        g, u, d = self.gate, self.up, self.down
+        tabs = [t.index_select(0, e) for t in (g.p_trellis, g.p_suh, g.p_svh, u.p_trellis, u.p_suh, u.p_svh,
+                                               d.p_trellis, d.p_suh, d.p_svh)]
+        tiers = ((1, 63, 16), (64, R, 64)) if g.mul1 else ((1, R, 16),)   # wide row tiles exist for mul1 only
+        for lo, hi, m_tile in tiers:
+            ext.exl3_moe(y, out, vcount, tok_sorted, w_sorted, self.tsg, self.tsu, self.tig, self.tiu,
+                         2 if self.gateless else 0, g.K, u.K, d.K, *tabs,
+                         g.mcg, g.mul1, u.mcg, u.mul1, d.mcg, d.mul1,
+                         0.0, -1, None, None, lo, hi, m_tile)
+
     def forward(self, x, topk_ids, topk_weights):
         out = self._sum(x, topk_ids, topk_weights)
         return out if self.out_scale == 1.0 else out * self.out_scale
@@ -140,6 +173,9 @@ class _Experts:
             # (0.3.0 checked T * k, which kept CUDA graphs at <= 32 tokens per step with mul1 and <= 16 with mcg). Everything in the kernel,
             # nothing read on the CPU, so this path can be captured in a CUDA graph.
             self.fused(y, out, count, tok_sorted, w_sorted, -1, 1, self.fused_rows)
+            return out
+        if os.environ.get("VLLM_QUANTPACK_MOE_VIRTUAL", "1") != "0":
+            self.fused_virtual(y, out, count, tok_sorted, w_sorted, T, k)
             return out
         counts = count.tolist()
         light = sum(1 for c in counts[:self.E] if 0 < c <= self.fused_rows)
