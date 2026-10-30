@@ -209,6 +209,27 @@ def _patch_decode_segments(segments, logger):
     return segments
 
 
+def _step_lengths(cu_seqlens_q, seqused_k):
+    """cu_seqlens_q and seqused_k as host lists, copied once per forward step (prefill steps run outside CUDA graphs).
+    Every attention layer of a step gets the same tensors and each copy makes the CPU wait for the GPU, so the lists
+    are kept on the step's forward context, keyed by the tensors themselves (other KV-cache groups get other ones)."""
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+        step = get_forward_context() if is_forward_context_available() else None
+    except Exception:
+        step = None
+    hit = getattr(step, "_quantpack_int4_lengths", None)
+    if hit is not None and hit[0] is cu_seqlens_q and hit[1] is seqused_k:
+        return hit[2], hit[3]
+    cu, used = cu_seqlens_q.tolist(), seqused_k.tolist()
+    if step is not None:
+        try:
+            step._quantpack_int4_lengths = (cu_seqlens_q, seqused_k, cu, used)
+        except Exception:
+            pass
+    return cu, used
+
+
 def _patch_long_prefill(stock, logger):
     """Route long-context prefill chunks to int4_prefill (FlashAttention over unpacked segments)."""
     if os.environ.get("VLLM_QUANTPACK_INT4_FA_PREFILL", "1") == "0":
@@ -234,7 +255,7 @@ def _patch_long_prefill(stock, logger):
                  and output_scale is None and mm_prefix_range is None)
         if not plain or max_seqlen_q < int4_prefill.MIN_QUERY or max_seqlen_k < int4_prefill.MIN_CONTEXT:
             return triton_path(q, k_cache, v_cache, out, **args)
-        cu, used = cu_seqlens_q.tolist(), seqused_k.tolist()   # prefill steps run outside CUDA graphs
+        cu, used = _step_lengths(cu_seqlens_q, seqused_k)
         long = [i for i in range(len(used)) if cu[i + 1] - cu[i] >= int4_prefill.MIN_QUERY
                 and used[i] >= int4_prefill.MIN_CONTEXT]
         if not long:

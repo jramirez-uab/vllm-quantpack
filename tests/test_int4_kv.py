@@ -224,6 +224,48 @@ def test_long_prefill_does_not_wait_for_the_gpu(int4_module):
     assert _relerr(out, _reference(m, q, cache, 0, n)) < 1e-2
 
 
+@gpu
+def test_long_prefill_reads_step_lengths_once_per_step(int4_module, monkeypatch):
+    """Every attention layer of a step gets the same cu_seqlens_q/seqused_k; only the first may copy them to the host."""
+    import types
+    import vllm.forward_context as fc
+    m = int4_module
+    n = 20000
+    nb = (n + BS - 1) // BS
+    cache = _cache(m, nb)
+    _fill(m, cache, 0, n, 0)
+    kc, vc, ks, vs = cache
+    q = torch.randn((256, NQ, HS), device="cuda", dtype=torch.bfloat16)
+    segm = [torch.empty(s, dtype=torch.float32, device="cuda") for s in ((32, NQ, 16, HS), (32, NQ, 16), (32, NQ, 16))]
+    args = dict(cu_seqlens_q=torch.tensor([0, 256], dtype=torch.int32, device="cuda"), max_seqlen_q=256,
+                seqused_k=torch.tensor([n], dtype=torch.int32, device="cuda"), max_seqlen_k=n, softmax_scale=HS ** -0.5,
+                window_size=(-1, -1), block_table=torch.arange(nb, dtype=torch.int32, device="cuda")[None],
+                softcap=0.0, sinks=None, alibi_slopes=None, use_alibi_sqrt=False, qq_bias=None, output_scale=None,
+                mm_prefix_range=None, k_scale_cache=ks, v_scale_cache=vs, seq_threshold_3D=32,
+                num_par_softmax_segments=16, softmax_segm_output=segm[0], softmax_segm_max=segm[1],
+                softmax_segm_expsum=segm[2])
+    step = types.SimpleNamespace()
+    monkeypatch.setattr(fc, "get_forward_context", lambda: step)
+    monkeypatch.setattr(fc, "is_forward_context_available", lambda: True)
+    assert int4_kv.patch_int4_kv(LOG)
+    ref = _reference(m, q, cache, 0, n)
+    first, second = torch.empty_like(q), torch.empty_like(q)
+    m.unified_attention_int4(q, kc, vc, first, **args)                  # first layer of the step: may sync
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        m.unified_attention_int4(q, kc, vc, second, **args)             # next layer, same step: must not
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert _relerr(first, ref) < 1e-2 and _relerr(second, ref) < 1e-2
+    step2 = types.SimpleNamespace()                                     # a new step re-reads the lengths
+    monkeypatch.setattr(fc, "get_forward_context", lambda: step2)
+    args["seqused_k"].fill_(n - 1000)
+    third = torch.empty_like(q)
+    m.unified_attention_int4(q[:256], kc, vc, third, **{**args, "max_seqlen_k": n - 1000})
+    assert _relerr(third, _reference(m, q, cache, 0, n - 1000)) < 1e-2
+
+
 def test_bench_tool_help(capsys):
     from vllm_quantpack.tools import int4_kv_bench
     with pytest.raises(SystemExit) as e:
