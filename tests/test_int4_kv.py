@@ -266,6 +266,30 @@ def test_long_prefill_reads_step_lengths_once_per_step(int4_module, monkeypatch)
     assert _relerr(third, _reference(m, q, cache, 0, n - 1000)) < 1e-2
 
 
+@gpu
+@pytest.mark.parametrize("qlen,n", [(256, 20000), (1000, 40000), (64, 9000), (8192, 8192)],
+                         ids=["chunk", "odd-chunk", "short", "first-chunk"])
+def test_i8_prefill_kernel_matches_fp64(int4_module, qlen, n):
+    """The single-kernel INT8-QK / FP16-PV prefill over the raw int4 cache: same bound as the FlashAttention path."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    from vllm_quantpack.attention import int4_prefill
+    m = int4_module
+    nb = (n + BS - 1) // BS
+    cache = _cache(m, nb + 3)
+    _fill(m, cache, 3, n, 0)                         # blocks 3.. so a wrong block-table lookup reads zeros
+    kc, vc, ks, vs = cache
+    q = torch.randn((qlen, NQ, HS), device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(3, nb + 3, dtype=torch.int32, device="cuda")
+    q_rot = m.single_rht(q.float()).to(q.dtype)
+    ref = _reference(m, q, cache, 3, n)
+    o = int4_prefill.prefill_sequence_i8(q_rot, kc, vc, ks, vs, table, n, HS ** -0.5 / HS)
+    out = (m.single_rht(o.float(), inverse=True) / HS).double()
+    fa = int4_prefill.prefill_sequence(q_rot, kc, vc, ks, vs, table, n, HS ** -0.5 / HS, flash_attn_varlen_func)
+    fa_err = _relerr((m.single_rht(fa.float(), inverse=True) / HS).double(), ref)
+    err = _relerr(out, ref)
+    assert err < 1e-2, f"i8 kernel {err:.3e} (FlashAttention path {fa_err:.3e})"
+
+
 def test_bench_tool_help(capsys):
     from vllm_quantpack.tools import int4_kv_bench
     with pytest.raises(SystemExit) as e:
