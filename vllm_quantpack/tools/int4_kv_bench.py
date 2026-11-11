@@ -93,7 +93,7 @@ def _relerr(o, ref):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--contexts", default="32768,131072,262144")
-    ap.add_argument("--decode", default=None, help="tile,warps,segments configs separated by ':' "
+    ap.add_argument("--decode", default=None, help="tile,warps,segments[,max query rows] configs separated by ':' "
                     "(default: 64,4 with 16, 32, 64 and 128 segments)")
     ap.add_argument("--prefill-tiles", default=None, help="BLOCK_M,TILE,warps,stages (default: the built-in table)")
     ap.add_argument("--q-heads", type=int, default=24)
@@ -129,7 +129,8 @@ def main(argv=None):
             for c in configs:
                 stock._launch_packed_attn = gens[c]
                 ms = _timed(lambda: _attend(stock, q, cache, nb, n, c[2], out))
-                print(f"ctx {n:>7} decode  tile {c[0]:>3} warps {c[1]} segments {c[2]:>3}  {ms:8.3f} ms  "
+                rows_m = f" max rows {c[3]:>2}" if len(c) > 3 else ""
+                print(f"ctx {n:>7} decode  tile {c[0]:>3} warps {c[1]} segments {c[2]:>3}{rows_m}  {ms:8.3f} ms  "
                       f"relerr {_relerr(out, ref):.1e}", flush=True)
             chunk = min(1024, n)
             q = torch.randn((chunk, nq, hs), device="cuda", dtype=torch.bfloat16)

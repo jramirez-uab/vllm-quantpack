@@ -73,6 +73,13 @@ def test_decode_override_from_environment(monkeypatch):
     assert int4_kv.decode_tiles(84) == (64, 4, 32)
 
 
+def test_decode_override_accepts_query_row_cap(monkeypatch):
+    monkeypatch.setenv("VLLM_QUANTPACK_INT4_DECODE", "64,4,auto,16")
+    assert int4_kv.decode_tiles(188) == (64, 4, 64, 16)
+    monkeypatch.setenv("VLLM_QUANTPACK_INT4_DECODE", "64,4,32,32")
+    assert int4_kv.decode_tiles(84) == (64, 4, 32, 32)
+
+
 @pytest.mark.parametrize("sms,segments", [(188, 64), (84, 32), (36, 16), (8, 16), (132, 64), (512, 128)],
                          ids=["rtx-pro-6000", "a40", "rtx-5060-ti", "tiny", "h100", "cap"])
 def test_segments_follow_sm_count(monkeypatch, sms, segments):
@@ -164,8 +171,9 @@ def int4_module(monkeypatch):
 
 @gpu
 @pytest.mark.parametrize("qlen,n,fa", [(256, 16384, "1"), (256, 16384, "0"), (256, 40000, "1"), (2, 16384, "1"),
-                                       (1, 16384, "1")],
-                         ids=["prefill-flashattn", "prefill-triton", "prefill-3-segments", "mtp-decode", "decode"])
+                                       (4, 16384, "1"), (3, 16384, "1"), (1, 16384, "1")],
+                         ids=["prefill-flashattn", "prefill-triton", "prefill-3-segments", "mtp-decode", "mtp3-decode",
+                              "mtp2-decode", "decode"])
 def test_patched_int4_attention_matches_fp64(int4_module, monkeypatch, qlen, n, fa):
     m = int4_module
     nb = (n + BS - 1) // BS
@@ -198,6 +206,28 @@ def test_mixed_batch_long_prefill_and_mtp_decode(int4_module):
     out = _attend(m, [q0, q1], cache, [(0, b0, n0), (b0, b1, n1)], int4_kv.decode_tiles(torch.cuda.get_device_properties(0).multi_processor_count)[2])
     assert _relerr(out[:256], _reference(m, q0, cache, 0, n0)) < 1e-2
     assert _relerr(out[256:], _reference(m, q1, cache, b0, n1)) < 1e-2
+
+
+@gpu
+@pytest.mark.parametrize("max_m", ["64", "32", "16"], ids=["one-program", "capped-32", "stock-rows"])
+def test_batched_mtp_decodes_with_wide_query_block(int4_module, monkeypatch, max_m):
+    """Sequences with 4, 3 and 1 query tokens in one step: every query row lands in its own sequence's output."""
+    monkeypatch.setenv("VLLM_QUANTPACK_INT4_DECODE", f"64,4,auto,{max_m}")
+    m = int4_module
+    lens = [(4, 20000), (3, 9000), (1, 16384), (4, 3072)]
+    blocks = [(n + BS - 1) // BS for _, n in lens]
+    cache = _cache(m, sum(blocks))
+    first = [sum(blocks[:i]) for i in range(len(lens))]
+    for i, (_, n) in enumerate(lens):
+        _fill(m, cache, first[i], n, i)
+    qs = [torch.randn((ql, NQ, HS), device="cuda", dtype=torch.bfloat16) for ql, _ in lens]
+    assert int4_kv.patch_int4_kv(LOG)
+    segments = int4_kv.decode_tiles(torch.cuda.get_device_properties(0).multi_processor_count)[2]
+    out = _attend(m, qs, cache, [(first[i], blocks[i], n) for i, (_, n) in enumerate(lens)], segments)
+    at = 0
+    for i, (ql, n) in enumerate(lens):
+        assert _relerr(out[at:at + ql], _reference(m, qs[i], cache, first[i], n)) < 1e-2, f"sequence {i}"
+        at += ql
 
 
 @gpu

@@ -33,6 +33,8 @@ attention is inaccurate at long context and slow. The plugin replaces it when th
   request; MTP verification has two, so decode scanned the whole context in 4 programs. The plugin uses it for up to 4
   query tokens, with 64-token tiles and a segment count sized to the GPU (next power of two of SMs / 4, from 16 to
   128; each extra 16 segments cost ~12.6 MiB at 24 query heads, head 256).
+  Each program holds every query token of the step (up to 64 query rows; vLLM's block is 16 rows = 2 tokens at 6
+  query heads per KV head), so a step with 3 draft tokens reads the cache once instead of twice.
 
 Measured with Swift-1.5 27B (EXL3 2.25 bpw), MTP 1, chunked prefill 1024, one request, tokens per second:
 
@@ -49,7 +51,7 @@ Options (environment variables of the vLLM process):
 |---|---|---|
 | `VLLM_QUANTPACK_INT4_KV` | `1` | `0` leaves vLLM's int4 attention untouched |
 | `VLLM_QUANTPACK_INT4_FA_PREFILL` | `1` | `0` keeps long prefills on the Triton kernel (no FlashAttention, no scratch) |
-| `VLLM_QUANTPACK_INT4_DECODE` | `64,4,auto` | split-KV decode `tile,warps,segments`; `segments` is a power of two or `auto` (from the SM count) |
+| `VLLM_QUANTPACK_INT4_DECODE` | `64,4,auto` | split-KV decode `tile,warps,segments[,rows]`; `segments` is a power of two or `auto` (from the SM count); `rows` caps the query rows per program (default 64; 16 is vLLM's block and reads the cache once per 2 query tokens) |
 | `VLLM_QUANTPACK_INT4_TILES` | `64,64,8,2` | Triton prefill `BLOCK_M,TILE,warps,stages` (short chunks, or with FlashAttention prefill off) |
 | `VLLM_QUANTPACK_CACHE` | `~/.cache/vllm-quantpack` | where the generated kernel module is written (Triton needs it on disk) |
 
