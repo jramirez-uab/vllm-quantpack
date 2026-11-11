@@ -144,17 +144,17 @@ def build_source(stock, tiles, decode=(64, 4, 16)):
             + kernel + "\n\n" + launch)   # the kernel source keeps its @triton.jit decorator
 
 
-def _load(src):
+def _load(src, name="int4_kv"):
     # Triton reads kernel source from the defining file, so the module must live on disk.
     base = os.environ.get("VLLM_QUANTPACK_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "vllm-quantpack")
     os.makedirs(base, exist_ok=True)
-    path = os.path.join(base, f"int4_kv_{hashlib.sha256(src.encode()).hexdigest()[:16]}.py")
+    path = os.path.join(base, f"{name}_{hashlib.sha256(src.encode()).hexdigest()[:16]}.py")
     if not os.path.exists(path):
         fd, tmp = tempfile.mkstemp(dir=base, suffix=".tmp")
         with os.fdopen(fd, "w") as fh:
             fh.write(src)
         os.replace(tmp, path)   # atomic: tensor-parallel workers may write the same file at once
-    spec = importlib.util.spec_from_file_location("vllm_quantpack_int4_kv_generated", path)
+    spec = importlib.util.spec_from_file_location(f"vllm_quantpack_{name}_generated", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

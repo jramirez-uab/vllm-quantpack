@@ -17,6 +17,8 @@ model-family fixes they need, in stock vLLM: no patch to vLLM, no per-model plug
   - **Qwen3.8-Flash-Next**: the FP8 PLE lookup on GPUs below sm_89.
 - vLLM's int4 KV cache (`--kv-cache-dtype int4_per_token_head`, TRITON_ATTN backend), made exact and fast enough to
   serve 262k-token sessions: see [int4 KV cache](#int4-kv-cache).
+- vLLM's TurboQuant KV cache (`--kv-cache-dtype turboquant_k8v4` and the other presets), made correct with
+  speculative decoding and on GPUs below sm_89: see [TurboQuant KV cache](#turboquant-kv-cache).
 
 ## int4 KV cache
 
@@ -70,6 +72,34 @@ On Blackwell (RTX 50xx, RTX PRO 6000), vLLM 0.31's FlashAttention 2 build carrie
 compiles it for the GPU on its first use: the first long prefill takes ~30 s more. The driver keeps the result in
 `~/.nv/ComputeCache`; a service without `HOME` (a systemd unit, for example) loses it and pays it at every start, so
 give it `HOME` or `CUDA_CACHE_PATH`. Ampere and Ada run the sm_80 code directly.
+
+
+## TurboQuant KV cache
+
+vLLM 0.33's TurboQuant backend (`turboquant_k8v4`: FP8 keys, 4-bit values) has two defects that the plugin fixes when
+the backend is present:
+
+- **Speculative decoding under CUDA graphs.** A verification step carries 1 + MTP query tokens per request, so vLLM
+  sends it down the prefill path, which reads request lengths as Python numbers; a CUDA graph freezes the lengths
+  seen at capture and every later step attends to the wrong context (Swift-1.5 27B, MTP 3, 62k-token prompt: 0 of 8
+  needles, repeated syllables; 8 of 8 without MTP or with `--enforce-eager`). The plugin gives each query token of
+  such a step its own decode row, computed with tensors only, and sizes the graph batch and the workspace for it.
+- **Keys on GPUs below sm_89** (Ampere: A40, RTX 30xx). There the stock kernels store keys as fp8e4b15, which
+  saturates far below the keys' range (relative error 0.93 on Qwen3.8-27B keys; 0 of 8 needles on an A40 even
+  without MTP). The plugin encodes and decodes E4M3 with integer operations in the same kernels: relative error 0.125
+  and the same cache bytes as on newer GPUs.
+
+Measured with Swift-1.5 27B (EXL3 3.85 bpw), MTP 3, one request, vLLM 0.33: needles 8 of 8 at 62k, 123k and 236k
+tokens and tool calls 15 of 15 on both an RTX PRO 6000 and an A40.
+
+Decode stays slow at long context, because the stock decode kernel scans the cache once per query head and per query
+token (tokens per second at 30k / 128k / 260k: 69 / 30 / 18 on the RTX PRO 6000, 32 / 12 / 6.5 on the A40; fp8 KV
+gives 88 at 260k on the RTX PRO 6000). Prefill is at fp8 speed. For long sessions prefer the
+[int4 KV cache](#int4-kv-cache), which holds more tokens and decodes four times faster.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VLLM_QUANTPACK_TURBOQUANT` | `1` | `0` leaves vLLM's TurboQuant attention untouched |
 
 ## Requirements
 
