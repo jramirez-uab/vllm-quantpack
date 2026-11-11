@@ -78,8 +78,8 @@ give it `HOME` or `CUDA_CACHE_PATH`. Ampere and Ada run the sm_80 code directly.
 
 ## k8v4 KV cache
 
-`--kv-cache-dtype k8v4_per_token_head` is a cache format the plugin adds to vLLM (0.33 or newer, which has the KV
-cache dtype registry). Per token and KV head it stores the key as int8 with one fp32 scale and the value as
+`--kv-cache-dtype k8v4_per_token_head` is a cache format the plugin adds to vLLM 0.33 (it needs vLLM's KV cache
+dtype registry; on a vLLM without it the option does not exist). Per token and KV head it stores the key as int8 with one fp32 scale and the value as
 `int4_per_token_head` does, both in the randomized-Hadamard domain: 1.5 bytes per element pair instead of 1 (int4)
 or 2 (fp8). The attention scores are where the int4 cache loses quality, so the keys get the 8 bits.
 
