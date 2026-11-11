@@ -37,6 +37,7 @@ import tempfile
 import textwrap
 
 MODULE = "vllm.v1.attention.ops.int4_per_token_head"
+PACKED_DTYPES = ("int4_per_token_head", "k8v4_per_token_head")   # caches served by the packed kernel
 MAX_Q_SPLIT_KV = 4               # MTP / EAGLE verification with up to 3 draft tokens
 # Triton prefill tiles (BLOCK_M, TILE_SIZE, num_warps, num_stages) by compute-capability major, from
 # int4_kv_bench. Ampere/Ada (8.x): A40. Consumer Blackwell (12.x): RTX PRO 6000 Server, to be confirmed on an
@@ -121,6 +122,30 @@ LAUNCH_EDITS = (
 )
 
 
+# k8v4_per_token_head (k8v4_kv.py): the same kernel with int8 keys, one byte per channel and no zero point. Applied
+# on top of KERNEL_EDITS / LAUNCH_EDITS; the value half and everything else stay as in the int4 kernel.
+K8V4_KERNEL_EDITS = (
+    ("def _attn_packed_qp(", "def _attn_k8v4_qp("),
+    ("    block_table_offset = seq_idx * block_table_stride\n",
+     "    offs_d = tl.arange(0, HEAD_SIZE_PADDED)\n"
+     "    dim_mask = offs_d < HEAD_SIZE\n"
+     "    Q = tl.load(query_ptr + q_base + offs_d[None, :], mask=dim_mask[None, :] & q_mask, other=0.0)\n"
+     "    block_table_offset = seq_idx * block_table_stride\n"),
+    ("+ packed_offs[:, None] * stride_k_cache_3", "+ offs_d[:, None] * stride_k_cache_3"),
+    ("mask=packed_dim_mask[:, None] & tile_mask[None, :],", "mask=dim_mask[:, None] & tile_mask[None, :],"),
+    ("K_s0_u, K_s1_u = unpack_int4_nibbles(K_packed)", "K = K_packed.to(query_ptr.dtype.element_ty)"),
+    ("        K_s0 = K_s0_u.to(query_ptr.dtype.element_ty)\n", ""),
+    ("        K_s1 = K_s1_u.to(query_ptr.dtype.element_ty)\n", ""),
+    ("k_token_head_scales = (ks_bits & -16).to(tl.float32, bitcast=True)", "k_token_head_scales = ks_raw"),
+    ("raw_dot = tl.dot(Q_s0, K_s0) + tl.dot(Q_s1, K_s1)", "raw_dot = tl.dot(Q, K)"),
+    ("S += (raw_dot - Q_sum[:, None] * k_zp[None, :]) * (", "S += raw_dot * ("),
+)
+K8V4_LAUNCH_EDITS = (
+    ("def _launch_packed_attn_qp(", "def _launch_k8v4_qp("),
+    ("_attn_packed_qp[grid](", "_attn_k8v4_qp[grid]("),
+)
+
+
 def _edit(src, edits, what):
     for old, new in edits:
         n = src.count(old)
@@ -141,7 +166,9 @@ def build_source(stock, tiles, decode=(64, 4, 16)):
             f"_QP_PREFILL_TILES = {tuple(tiles)!r}\n"
             f"_QP_DECODE_TILES = {tuple(decode)!r}\n"
             f"_QP_MAX_Q_SPLIT_KV = {MAX_Q_SPLIT_KV}\n\n\n"
-            + kernel + "\n\n" + launch)   # the kernel source keeps its @triton.jit decorator
+            + kernel + "\n\n" + launch + "\n\n"   # the kernel source keeps its @triton.jit decorator
+            + _edit(kernel, K8V4_KERNEL_EDITS, "k8v4 kernel") + "\n\n"
+            + _edit(launch, K8V4_LAUNCH_EDITS, "k8v4 launcher"))
 
 
 def _load(src, name="int4_kv"):
@@ -180,20 +207,27 @@ def patch_int4_kv(logger):
     except Exception as e:
         logger.warning("vllm-quantpack: int4_per_token_head attention left stock (%s)", e)
         return False
-    launch = gen._launch_packed_attn_qp
+    from . import k8v4_kv
+
+    def launch(**kw):
+        return (gen._launch_k8v4_qp if k8v4_kv.is_k8v4(kw["k_cache"]) else gen._launch_packed_attn_qp)(**kw)
+
     launch._quantpack = True
     stock._launch_packed_attn = launch   # unified_attention_int4 looks it up in the module globals at call time
     segments = _patch_decode_segments(decode[2], logger)
     fa_prefill = _patch_long_prefill(stock, logger)
+    k8v4 = k8v4_kv.patch_backend(stock, logger) and k8v4_kv.register_dtype(logger)
     logger.info("vllm-quantpack: int4_per_token_head KV attention fixed (exact zero point, prefill tiles %s, split-KV "
                 "decode with MTP, tile %d x %s segments, up to %d query rows%s)", tiles, decode[0], segments or "stock",
                 (tuple(decode) + (DECODE_MAX_M,))[3],
                 ", FlashAttention for long prefills" if fa_prefill else "")
+    if k8v4:
+        logger.info("vllm-quantpack: KV cache dtype %s available (int8 keys, int4 values)", k8v4_kv.NAME)
     return True
 
 
 def _patch_decode_segments(segments, logger):
-    """Allocate the split-KV segment buffers of int4 caches for `segments` segments instead of vLLM's 16."""
+    """Allocate the split-KV segment buffers of int4 and k8v4 caches for `segments` segments instead of vLLM's 16."""
     try:
         from vllm.v1.attention.backends import triton_attn
         builder = triton_attn.TritonAttentionMetadataBuilder
@@ -209,7 +243,7 @@ def _patch_decode_segments(segments, logger):
         return 0
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
-        if vllm_config.cache_config.cache_dtype != "int4_per_token_head":
+        if vllm_config.cache_config.cache_dtype not in PACKED_DTYPES:
             return stock_init(self, kv_cache_spec, layer_names, vllm_config, device)
         saved = triton_attn.NUM_PAR_SOFTMAX_SEGMENTS
         triton_attn.NUM_PAR_SOFTMAX_SEGMENTS = segments   # read once, in __init__, to size the buffers

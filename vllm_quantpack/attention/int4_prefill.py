@@ -47,14 +47,40 @@ def _unpack_segment(cache_ptr, scale_ptr, block_table_ptr, out_ptr, start, lengt
              mask=ok[:, None])
 
 
+@triton.jit
+def _unpack_segment_i8(cache_ptr, scale_ptr, block_table_ptr, out_ptr, start, length,
+                       stride_c0, stride_c1, stride_c2, stride_s0, stride_s1, stride_s2,
+                       stride_o0, stride_o1,
+                       BLOCK_SIZE: tl.constexpr, HEAD: tl.constexpr, TOKENS: tl.constexpr):
+    """out[t, h, :] = int8 * scale for cache positions start + t (the keys of a k8v4_per_token_head cache)."""
+    t = tl.program_id(0) * TOKENS + tl.arange(0, TOKENS)
+    h = tl.program_id(1)
+    ok = t < length
+    pos = start + t
+    blk = tl.load(block_table_ptr + pos // BLOCK_SIZE, mask=ok, other=0).to(tl.int64)
+    slot = pos % BLOCK_SIZE
+    c = tl.arange(0, HEAD)
+    codes = tl.load(cache_ptr + blk[:, None] * stride_c0 + slot[:, None] * stride_c1 + h * stride_c2 + c[None, :],
+                    mask=ok[:, None], other=0)
+    scale = tl.load(scale_ptr + blk * stride_s0 + slot * stride_s1 + h * stride_s2, mask=ok, other=0.0)
+    vals = (codes.to(tl.float32) * scale[:, None]).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + t[:, None].to(tl.int64) * stride_o0 + h * stride_o1 + c[None, :], vals, mask=ok[:, None])
+
+
 def unpack_segment(cache, scales, block_row, start, length, out):
-    """Unpack cache positions [start, start + length) of one sequence into out[:length] (L, KV heads, head size)."""
-    nkv, half = cache.shape[2], cache.shape[3] - 4 // cache.element_size()
+    """Unpack cache positions [start, start + length) of one sequence into out[:length] (L, KV heads, head size).
+    An int8 cache view holds one code per channel (k8v4 keys); a uint8 one, two nibbles per byte."""
+    nkv, head = cache.shape[2], out.shape[2]
     tokens = 16
-    _unpack_segment[(triton.cdiv(length, tokens), nkv)](
-        cache, scales, block_row, out, start, length,
-        cache.stride(0), cache.stride(1), cache.stride(2), scales.stride(0), scales.stride(1), scales.stride(2),
-        out.stride(0), out.stride(1), BLOCK_SIZE=cache.shape[1], HALF=half, TOKENS=tokens)
+    strides = (cache.stride(0), cache.stride(1), cache.stride(2), scales.stride(0), scales.stride(1),
+               scales.stride(2), out.stride(0), out.stride(1))
+    grid = (triton.cdiv(length, tokens), nkv)
+    if cache.dtype == torch.int8:
+        _unpack_segment_i8[grid](cache, scales, block_row, out, start, length, *strides,
+                                 BLOCK_SIZE=cache.shape[1], HEAD=head, TOKENS=tokens)
+    else:
+        _unpack_segment[grid](cache, scales, block_row, out, start, length, *strides,
+                              BLOCK_SIZE=cache.shape[1], HALF=head // 2, TOKENS=tokens)
 
 
 def _cu_seqlens(length, device):

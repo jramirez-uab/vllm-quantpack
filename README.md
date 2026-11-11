@@ -19,6 +19,8 @@ model-family fixes they need, in stock vLLM: no patch to vLLM, no per-model plug
   serve 262k-token sessions: see [int4 KV cache](#int4-kv-cache).
 - vLLM's TurboQuant KV cache (`--kv-cache-dtype turboquant_k8v4` and the other presets), made correct with
   speculative decoding and on GPUs below sm_89: see [TurboQuant KV cache](#turboquant-kv-cache).
+- A KV cache with int8 keys and int4 values (`--kv-cache-dtype k8v4_per_token_head`): closer to fp8 in quality than
+  int4, 1.3 times the tokens of fp8 in the same memory, at int4 speed: see [k8v4 KV cache](#k8v4-kv-cache).
 
 ## int4 KV cache
 
@@ -73,6 +75,35 @@ compiles it for the GPU on its first use: the first long prefill takes ~30 s mor
 `~/.nv/ComputeCache`; a service without `HOME` (a systemd unit, for example) loses it and pays it at every start, so
 give it `HOME` or `CUDA_CACHE_PATH`. Ampere and Ada run the sm_80 code directly.
 
+
+## k8v4 KV cache
+
+`--kv-cache-dtype k8v4_per_token_head` is a cache format the plugin adds to vLLM (0.33 or newer, which has the KV
+cache dtype registry). Per token and KV head it stores the key as int8 with one fp32 scale and the value as
+`int4_per_token_head` does, both in the randomized-Hadamard domain: 1.5 bytes per element pair instead of 1 (int4)
+or 2 (fp8). The attention scores are where the int4 cache loses quality, so the keys get the 8 bits.
+
+It reuses the int4 attention of this plugin (same prefill and split-KV decode, with the key half read as int8), so
+it needs the int4 patch: with `VLLM_QUANTPACK_INT4_KV=0` the dtype is not registered and vLLM rejects the option.
+The `VLLM_QUANTPACK_INT4_*` variables apply to it as well.
+
+KL divergence of the next-token distribution against a bf16 cache (Swift-1.5 27B BF16, last 2,048 positions of a
+250k-token context; lower is better): int8 0.0011, fp8 0.0023, **k8v4_per_token_head 0.0032**, vLLM's
+`turboquant_k8v4` 0.0065, int4 0.0093.
+
+Served with Swift-1.5 27B (EXL3 3.85 bpw), 262,144-token sessions, MTP 3, one request, vLLM 0.33, 20 GB of KV cache:
+
+| | RTX PRO 6000 | A40 |
+|---|---|---|
+| KV cache capacity, tokens (fp8 517k, int4 912k) | 650,777 | 663,726 |
+| Prefill, tokens/s at 30k / 128k / 260k | 2843 / 2363 / 1845 | 1314 / 965 / 787 |
+| Decode, tokens/s at 30k / 128k / 260k | 97 / 86 / 73 | 62 / 57 / 37 |
+| 8-fact needle at 62k, 123k, 236k | 8 of 8 each | 8 of 8 each |
+| Tool calls (real agent request) | 15 of 15 | 15 of 15 |
+
+Speeds are those of the int4 cache on the same setup (260k: 1895 / 74 and 824 / 39); fp8 gives 1727 / 88 and
+724 / 42. Decode figures with MTP move by some 20 % between runs with the acceptance rate. The first request after a
+start compiles the kernels (about a minute on a cold Triton cache).
 
 ## TurboQuant KV cache
 
@@ -142,6 +173,7 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 | EXL3 linear, int8 embedding, lm_head | validated: same scores as the previous stack (dense Qwen 27B) |
 | EXL3 int4 embedding | validated (dense Qwen 27B): KLD +0.16 % vs bf16 table, tool calls and agent tasks unchanged |
 | int4 KV cache attention (`int4_per_token_head`) | validated (Swift-1.5 27B 2.25 bpw on an A40 limited to 16 GB, 262,144 tokens, MTP 1): tool calls 30/30, agent tasks 10/10, 9/10, 10/10; speed above, A40 and RTX PRO 6000 |
+| int8-key / int4-value KV cache (`k8v4_per_token_head`) | measured on one model (Swift-1.5 27B, A40 and RTX PRO 6000, vLLM 0.33): numbers above; not tried on other models |
 | EXL3 MoE | validated on one GPU (Groot 19B-A3B): same as the previous stack within run-to-run noise |
 | Tensor / expert parallelism | validated with MoE TP2 + EP (Groot 19B-A3B); Flash-Next TP not tested yet |
 | Qwen vision, Flash-Next PLE | validated (Kestrel, Groot, Flash-Next 2.25) |
