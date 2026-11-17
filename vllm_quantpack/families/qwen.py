@@ -4,6 +4,7 @@
    quantized `attn.q_proj` / `k_proj` / `v_proj` tensors. vLLM only knows the fused `attn.qkv`, so the split copies are
    dropped at load time and the vision attention stays dense (~215 MB); the rest of the vision tower stays EXL3.
    Checkpoints without the split copies (GPTQ, BF16) are unaffected: the rule never matches.
+   From vLLM 0.34 CUDA loads Qwen3.5 from vllm/models/qwen3_5/nvidia; fixes 1 and 3 patch both implementations.
 2. Flash-Next PLE: its FP8 n-gram table, kept in pinned host memory, is looked up by a Triton kernel typed float8e4nv,
    which Triton rejects below sm_89 (Ampere). There the lookup copies the rows as bytes (uint8 views) and the
    dequantization stays in torch, which works on every GPU.
@@ -19,19 +20,33 @@ Origin: qwen38_exl3_vision 0.4.1 __init__.py (ours).
 import re
 
 
+def _qwen3_5_modules(*names):
+    """The Qwen3.5 model modules this vLLM has, by attribute: the classic torch.compile implementation
+    (vllm.model_executor.models.qwen3_5 / qwen3_5_mtp) and, from vLLM 0.34, the NVIDIA eager implementation
+    (vllm.models.qwen3_5.nvidia.model / .mtp) that the registry loads on CUDA. A class is patched wherever it exists."""
+    import importlib
+    mods = []
+    for old, new in (("vllm.model_executor.models.qwen3_5", "vllm.models.qwen3_5.nvidia.model"),
+                     ("vllm.model_executor.models.qwen3_5_mtp", "vllm.models.qwen3_5.nvidia.mtp")):
+        for name in (old, new):
+            try:
+                mods.append(importlib.import_module(name))
+            except Exception:
+                pass
+    return [getattr(m, n) for m in mods for n in names if hasattr(m, n)]
+
+
 def patch_vision_qkv():
     try:
-        from vllm.model_executor.models import qwen3_5
+        from vllm.model_executor.models.utils import WeightsMapper
     except ImportError:
         return
-    from vllm.model_executor.models.utils import WeightsMapper
-
-    cls = qwen3_5.Qwen3_5ForConditionalGeneration
-    if getattr(cls, "_quantpack_vision", False):
-        return
     drop = WeightsMapper(orig_to_new_regex={re.compile(r"^model\.visual\.blocks\.\d+\.attn\.[qkv]_proj\."): None})
-    cls.hf_to_vllm_mapper = drop | cls.hf_to_vllm_mapper
-    cls._quantpack_vision = True
+    for cls in _qwen3_5_modules("Qwen3_5ForConditionalGeneration"):
+        if cls.__dict__.get("_quantpack_vision", False):
+            continue
+        cls.hf_to_vllm_mapper = drop | cls.hf_to_vllm_mapper
+        cls._quantpack_vision = True
 
 
 def patch_ple_fp8_lookup():
@@ -67,15 +82,14 @@ def patch_ple_fp8_lookup():
 
 def patch_embed_prefix():
     try:
-        from vllm.model_executor.models import qwen3_5, qwen3_5_mtp
+        from vllm.model_executor.models.utils import maybe_prefix
     except ImportError:
         return
-    from vllm.model_executor.models.utils import maybe_prefix
 
     from ..exl3.layers import embedding_prefix
 
-    for cls in (qwen3_5.Qwen3_5Model, qwen3_5_mtp.Qwen3_5MultiTokenPredictor):
-        if getattr(cls, "_quantpack_embed_prefix", False):
+    for cls in _qwen3_5_modules("Qwen3_5Model", "Qwen3_5MultiTokenPredictor"):
+        if cls.__dict__.get("_quantpack_embed_prefix", False):
             continue
 
         def make(orig_init):
