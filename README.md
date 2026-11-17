@@ -134,7 +134,9 @@ gives 88 at 260k on the RTX PRO 6000). Prefill is at fp8 speed. For long session
 
 ## Requirements
 
-- vLLM 0.31 (0.30 also works).
+- vLLM 0.34 (0.31 and 0.33 also work; `k8v4_per_token_head` needs 0.33 or newer). vLLM 0.34 moved the Qwen 3.5 / 3.6
+  model to a new module: use 0.1.6 or newer of this plugin there, or the vision tower fails to load with
+  `There is no module or parameter named 'blocks.0.attn.k_proj' in Qwen3_VisionTransformer`.
 - exllamav3 1.6.5, as the prebuilt wheel that matches your torch and CUDA. The prebuilt wheels are on the
   [exllamav3 releases](https://github.com/turboderp-org/exllamav3/releases) page; PyPI only has a generic wheel that
   compiles the CUDA kernels on first use (it needs a CUDA toolkit and takes a while). For vLLM 0.31 (torch 2.13.0, CUDA 13):
@@ -144,6 +146,8 @@ gives 88 at 260k on the RTX PRO 6000). Prefill is at fp8 speed. For long session
   pip install /tmp/$W
   ```
   For other versions: `python -c "import torch; print(torch.__version__, torch.version.cuda)"` and pick the matching asset.
+  vLLM 0.34 uses torch 2.14, which has no prebuilt exllamav3 wheel yet: install it from PyPI
+  (`pip install exllamav3`, the kernels compile on first use) or build it from source.
 - An NVIDIA GPU of compute capability 8.0 or newer (Ampere, Ada, Hopper, Blackwell).
 - FlashInfer's prebuilt kernels in the same environment, unless you have a CUDA toolkit: without them vLLM looks for
   `nvcc` at start and fails with `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`. For vLLM 0.31:
