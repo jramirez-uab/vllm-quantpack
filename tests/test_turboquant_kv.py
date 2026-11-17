@@ -78,7 +78,8 @@ def test_speculative_limit_comes_from_the_builder_config():
     Impl()._prefill_attention(query, None, None, None, meta, None, None)
     assert calls == ["stock"] and Impl()._max_capture_batch_size() == 2
     builder = Builder()
-    builder.vllm_config = NS(speculative_config=NS(num_speculative_tokens=3, parallel_drafting=False),
+    builder.vllm_config = NS(speculative_config=NS(num_speculative_tokens=3, parallel_drafting=False,
+                                                        max_num_new_slots_for_drafting=0),
                              use_v2_model_runner=True, scheduler_config=NS(max_num_seqs=2))
     builder._reserve_workspace()
     Impl()._prefill_attention(query, None, None, None, meta, None, None)
