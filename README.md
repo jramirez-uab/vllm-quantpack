@@ -178,7 +178,7 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 | EXL3 int4 embedding | validated (dense Qwen 27B): KLD +0.16 % vs bf16 table, tool calls and agent tasks unchanged |
 | int4 KV cache attention (`int4_per_token_head`) | validated (Swift-1.5 27B 2.25 bpw on an A40 limited to 16 GB, 262,144 tokens, MTP 1): tool calls 30/30, agent tasks 10/10, 9/10, 10/10; speed above, A40 and RTX PRO 6000 |
 | int8-key / int4-value KV cache (`k8v4_per_token_head`) | measured on Swift-1.5 27B (numbers above), Nemotron 3.5 Lightning and Qwen3-4B-Instruct-2507 (vLLM 0.34): KLD vs a bf16 cache below fp8's at 32k, 128k and 250k on all three; Gemma 4 26B-A4B (head 512) served on an A40, where vLLM's Triton backend has no fp8 cache |
-| Gemma 4 EXL3 (padded dense MLP) | served (turboderp 4.10 bpw, A40, vLLM 0.34); long int4/k8v4 prefills with head 512 run on FlashInfer |
+| Gemma 4 EXL3 (padded dense MLP) | served (turboderp 4.10 bpw, A40, vLLM 0.34); long int4/k8v4 prefills with head 512 run on Triton (FlashAttention stops at 256; FlashInfer measured 2.7-2.9x slower) |
 | EXL3 MoE | validated on one GPU (Groot 19B-A3B): same as the previous stack within run-to-run noise |
 | Tensor / expert parallelism | validated with MoE TP2 + EP (Groot 19B-A3B); Flash-Next TP not tested yet |
 | Qwen vision, Flash-Next PLE | validated (Kestrel, Groot, Flash-Next 2.25) |
