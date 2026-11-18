@@ -16,6 +16,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+MAX_HEAD = 256       # largest head size FlashAttention's varlen forward accepts
+MAX_HEAD_FLASHINFER = 512   # FlashInfer's prefill goes up to 512 (Gemma 4 global layers), Ampere included
 SEGMENT = 16384      # tokens per segment: 16k x 4 KV heads x 256 x (K, V) x bf16 = 64 MiB of scratch
 MIN_QUERY = 64       # a chunk shorter than this is cheap on the Triton kernel
 MIN_CONTEXT = 8192   # below this the Triton kernel is already fast
@@ -169,6 +171,7 @@ def _attn_i8(q_even, q_odd, q_even_lo, q_odd_lo, q_scale, q_sum, k_cache, v_cach
 
 
 LOG2E = 1.4426950408889634
+LN2 = 0.6931471805599453
 Q_LO = 254           # weight of the high int8 part of Q: hi * 254 + lo fits int32 (|dot| <= 128 * 127 * 15)
 
 
@@ -229,3 +232,13 @@ def prefill_sequence(q_rot, k_cache, v_cache, k_scales, v_scales, block_row, n, 
             acc_lse = new_lse
         end = start
     return acc.to(q_rot.dtype)
+
+
+def flashinfer_attn(q, k, v, *, causal, softmax_scale, **_):
+    """FlashAttention-shaped call over FlashInfer's single prefill, for head sizes FlashAttention refuses (> 256).
+    Returns (output, log-sum-exp as (heads, tokens) in natural log), like flash_attn_varlen_func with
+    return_softmax_lse; FlashInfer reports the log-sum-exp in base 2 and per (token, head)."""
+    import flashinfer
+    o, lse = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal, sm_scale=softmax_scale, return_lse=True)
+    return o, (lse.float() * LN2).T
+

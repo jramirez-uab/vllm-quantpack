@@ -192,6 +192,25 @@ def test_patched_int4_attention_matches_fp64(int4_module, monkeypatch, qlen, n, 
 
 
 @gpu
+@pytest.mark.parametrize("n", [16384, 40000], ids=["one-segment", "3-segments"])
+def test_int4_head_512_prefill_matches_fp64(int4_module, monkeypatch, n):
+    """Gemma 4 global layers (head 512): the long int4 prefill goes through FlashInfer (FlashAttention stops at 256)."""
+    import sys
+    m = int4_module
+    for name, value in (("NQ", 16), ("NKV", 2), ("HS", 512)):
+        monkeypatch.setattr(sys.modules[__name__], name, value)
+    monkeypatch.setenv("VLLM_QUANTPACK_INT4_FA_PREFILL", "1")
+    assert int4_kv.patch_int4_kv(LOG)
+    nb = (n + BS - 1) // BS
+    cache = _cache(m, nb)
+    _fill(m, cache, 0, n, 0)
+    q = torch.randn((256, 16, 512), device="cuda", dtype=torch.bfloat16)
+    err = _relerr(_attend(m, [q], cache, [(0, nb, n)], int4_kv.decode_tiles(
+        torch.cuda.get_device_properties(0).multi_processor_count)[2]), _reference(m, q, cache, 0, n))
+    assert err < 1e-2, f"relative error {err:.3e}"
+
+
+@gpu
 def test_mixed_batch_long_prefill_and_mtp_decode(int4_module):
     """One step with a long prefill chunk (FlashAttention path) and an MTP decode (Triton sub-batch)."""
     m = int4_module
