@@ -33,7 +33,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from . import hooks
 from . import ops  # noqa: F401  (registers quantpack::exl3_gemm)
 from .names import expand, manifest_prefixes, norm_prefix, slot, trellis_k
-from .tp_ranges import col_ranges, logical_parts, on_block, row_range
+from .tp_ranges import col_ranges, logical_parts, on_block, padded_shard_cols, row_range
 
 logger = init_logger("vllm.quantpack.exl3")
 
@@ -182,6 +182,7 @@ class Exl3LinearMethod(LinearMethodBase):
         for suffix in LINEAR_SUFFIXES:
             layer.register_parameter(suffix, Exl3ShardParam(suffix=suffix))
         layer.exl3_out_total = sum(output_partition_sizes)
+        layer.exl3_out_sizes = list(output_partition_sizes)
         layer.exl3_tp = None
         layer.exl3_row_pad = None
         layer.exl3_col_sel = None
@@ -235,6 +236,13 @@ class Exl3LinearMethod(LinearMethodBase):
                 for i in slots
             ]
             got = sum(s["oc"] for s in layer.exl3_shards)
+            if got != layer.exl3_out_total and sel is None and len(layer.exl3_shards) > 1:
+                # fused layer whose shards exllamav3 padded to a multiple of 128 (Gemma 4 dense mlp.gate_up_proj)
+                try:
+                    sel = padded_shard_cols([s["oc"] for s in layer.exl3_shards], layer.exl3_out_sizes)
+                except NotImplementedError as e:
+                    raise RuntimeError(f"{self.prefix}: {e}") from None
+                layer.exl3_out_total = got
             if got != layer.exl3_out_total:
                 raise RuntimeError(f"{self.prefix}: shards give {got} outputs, layer wants {layer.exl3_out_total}")
         release(layer, LINEAR_SUFFIXES)

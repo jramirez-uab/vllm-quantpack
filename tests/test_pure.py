@@ -2,7 +2,7 @@
 import pytest
 
 from vllm_quantpack.exl3.names import expand, manifest_prefixes, norm_prefix, slot, trellis_k
-from vllm_quantpack.exl3.tp_ranges import col_ranges, logical_parts, on_block, row_range
+from vllm_quantpack.exl3.tp_ranges import col_ranges, logical_parts, on_block, padded_shard_cols, row_range
 
 
 def test_slot_maps_every_loader_shard_id_form():
@@ -73,6 +73,17 @@ def test_col_ranges_padded_single_layer():
     assert [col_ranges(4352, [0], [2152], r, 2) for r in range(2)] == [[(0, 2152)], [(2152, 4304)]]
     with pytest.raises(NotImplementedError):     # 128 extra columns or more is not padding
         col_ranges(4432, [0], [2152], 0, 2)
+
+
+def test_padded_shard_cols_keeps_each_shards_real_columns():
+    # Gemma 4 dense mlp.gate_up_proj: gate and up (2112 each) are stored padded to 2176 each
+    cols = padded_shard_cols([2176, 2176], [2112, 2112])
+    assert cols == list(range(0, 2112)) + list(range(2176, 2176 + 2112))
+    assert padded_shard_cols([2112, 2112], [2112, 2112]) is None          # nothing to trim
+    with pytest.raises(NotImplementedError):                              # 128 extra columns or more is not padding
+        padded_shard_cols([2304, 2176], [2112, 2112])
+    with pytest.raises(NotImplementedError):                              # a shard short of outputs
+        padded_shard_cols([2048, 2176], [2112, 2112])
 
 
 def test_col_ranges_rejects_a_split_that_does_not_add_up():

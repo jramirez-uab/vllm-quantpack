@@ -52,3 +52,17 @@ def row_range(rank: int, in_local: int) -> tuple[int, int]:
 
 def on_block(ranges, block: int = 128) -> bool:
     return all(a % block == 0 and b % block == 0 for a, b in ranges)
+
+
+def padded_shard_cols(stored: list[int], wanted: list[int], block: int = 128) -> list[int] | None:
+    """Output columns to keep from a fused layer whose shards exllamav3 stored padded (e.g. Gemma 4 dense
+    mlp.gate_up_proj: 2112 -> 2176 per shard). None when no shard is padded."""
+    if len(stored) != len(wanted) or any(not 0 <= s - w < block for s, w in zip(stored, wanted)):
+        raise NotImplementedError(f"shards give {stored} outputs, layer wants {wanted}")
+    if stored == wanted:
+        return None
+    cols, off = [], 0
+    for s, w in zip(stored, wanted):
+        cols += range(off, off + w)
+        off += s
+    return cols
