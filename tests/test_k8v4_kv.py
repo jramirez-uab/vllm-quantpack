@@ -207,9 +207,9 @@ def test_int4_cache_still_goes_through_the_int4_kernels(vllm_int4):
 
 @gpu
 @pytest.mark.parametrize("qlen,n,fa", [(256, 16384, "1"), (256, 40000, "1"), (256, 16384, "0"), (1, 16384, "1")],
-                         ids=["prefill-flashinfer", "prefill-3-segments", "prefill-triton", "decode"])
+                         ids=["prefill-fa-on", "prefill-3-segments", "prefill-fa-off", "decode"])
 def test_k8v4_head_512_attention_matches_fp64(vllm_int4, monkeypatch, qlen, n, fa):
-    """Gemma 4 global layers (head 512): FlashAttention stops at head 256, so long prefills go through FlashInfer."""
+    """Gemma 4 global layers (head 512): FlashAttention stops at head 256, so long prefills stay on Triton."""
     import sys
     m = vllm_int4
     monkeypatch.setenv("VLLM_QUANTPACK_INT4_FA_PREFILL", fa)

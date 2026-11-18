@@ -194,7 +194,7 @@ def test_patched_int4_attention_matches_fp64(int4_module, monkeypatch, qlen, n, 
 @gpu
 @pytest.mark.parametrize("n", [16384, 40000], ids=["one-segment", "3-segments"])
 def test_int4_head_512_prefill_matches_fp64(int4_module, monkeypatch, n):
-    """Gemma 4 global layers (head 512): the long int4 prefill goes through FlashInfer (FlashAttention stops at 256)."""
+    """Gemma 4 global layers (head 512): the long int4 prefill stays on Triton (FlashAttention stops at 256)."""
     import sys
     m = int4_module
     for name, value in (("NQ", 16), ("NKV", 2), ("HS", 512)):

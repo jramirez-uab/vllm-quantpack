@@ -299,9 +299,10 @@ def _patch_long_prefill(stock, logger):
                     block_table=block_table, softcap=softcap, sinks=sinks, alibi_slopes=alibi_slopes,
                     use_alibi_sqrt=use_alibi_sqrt, qq_bias=qq_bias, output_scale=output_scale,
                     mm_prefix_range=mm_prefix_range, k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache, **kw)
-        # FlashAttention takes head sizes up to 256; Gemma 4 global layers (512) go through FlashInfer
+        # FlashAttention takes head sizes up to 256: Gemma 4 global layers (512) stay on Triton, which on an RTX 3090
+        # is 2.7x faster than FlashInfer's single prefill at head 512 (121 vs 322 ms per 4096-token chunk at 16k)
         plain = (window_size[0] < 0 and not softcap and sinks is None and alibi_slopes is None and qq_bias is None
-                 and output_scale is None and mm_prefix_range is None and q.shape[2] <= int4_prefill.MAX_HEAD_FLASHINFER)
+                 and output_scale is None and mm_prefix_range is None and q.shape[2] <= int4_prefill.MAX_HEAD)
         if not plain or max_seqlen_q < int4_prefill.MIN_QUERY or max_seqlen_k < int4_prefill.MIN_CONTEXT:
             return triton_path(q, k_cache, v_cache, out, **args)
         cu, used = _step_lengths(cu_seqlens_q, seqused_k)
@@ -324,9 +325,7 @@ def _patch_long_prefill(stock, logger):
         for i in long:
             q_rot = stock.single_rht(q[cu[i]:cu[i + 1]].float()).to(q.dtype)
             o = int4_prefill.prefill_sequence(q_rot, k_cache, v_cache, k_scale_cache, v_scale_cache, block_table[i],
-                                              used[i], softmax_scale / head,
-                                              flash_attn_varlen_func if head <= int4_prefill.MAX_HEAD
-                                              else int4_prefill.flashinfer_attn)
+                                              used[i], softmax_scale / head, flash_attn_varlen_func)
             out[cu[i]:cu[i + 1]] = (stock.single_rht(o.float(), inverse=True) / head).to(out.dtype)
 
     unified_attention_int4._quantpack = True
