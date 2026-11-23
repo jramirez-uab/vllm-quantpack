@@ -345,3 +345,22 @@ def test_bench_tool_help(capsys):
         int4_kv_bench.main(["--help"])
     assert e.value.code == 0
     assert "VLLM_QUANTPACK_INT4_DECODE" in capsys.readouterr().out
+
+
+def test_generated_source_is_written_as_utf8_under_a_non_utf8_locale(tmp_path):
+    """Issue #1: the generated kernel source carries non-ASCII comments copied from vLLM
+    (e.g. U+2192). Under a non-UTF-8 locale (Windows ANSI code pages) writing it with the
+    locale encoding raised UnicodeEncodeError and the fast kernel was silently left stock."""
+    import os
+    import subprocess
+    code = ("from vllm_quantpack.attention import int4_kv\n"
+            "m = int4_kv._load('X = \"\\u2192\"\\n', 'encoding_check')\n"
+            "assert m.X == '\\u2192', m.X\n"
+            "print('LOADED')\n")
+    env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0",
+               VLLM_QUANTPACK_CACHE=str(tmp_path))
+    env.pop("PYTHONUTF8", None)
+    r = subprocess.run([sys.executable, "-X", "utf8=0", "-c", code], env=env,
+                       capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "LOADED" in r.stdout

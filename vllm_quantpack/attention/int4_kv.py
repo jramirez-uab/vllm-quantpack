@@ -178,7 +178,7 @@ def _load(src, name="int4_kv"):
     path = os.path.join(base, f"{name}_{hashlib.sha256(src.encode()).hexdigest()[:16]}.py")
     if not os.path.exists(path):
         fd, tmp = tempfile.mkstemp(dir=base, suffix=".tmp")
-        with os.fdopen(fd, "w") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:   # vLLM kernel source carries non-ASCII comments
             fh.write(src)
         os.replace(tmp, path)   # atomic: tensor-parallel workers may write the same file at once
     spec = importlib.util.spec_from_file_location(f"vllm_quantpack_{name}_generated", path)
@@ -205,7 +205,7 @@ def patch_int4_kv(logger):
         tiles, decode = prefill_tiles(major), decode_tiles(sms)
         gen = _load(build_source(stock, tiles, decode))
     except Exception as e:
-        logger.warning("vllm-quantpack: int4_per_token_head attention left stock (%s)", e)
+        logger.warning("vllm-quantpack: int4_per_token_head fast kernel not loaded, attention left stock: int4 decode will run about 3x slower (%s)", e)
         return False
     from . import k8v4_kv
 
