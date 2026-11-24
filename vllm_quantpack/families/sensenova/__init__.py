@@ -50,7 +50,22 @@ def _register_verify(logger):
     return True
 
 
+_ORIG_HF_CONFIG_OVERRIDE = None
+
+
+def _hf_config_override(hf_config, *args, **kwargs):
+    # The SenseNova Loop MTP head is a Qwen3.5 MTP layer (mtp.* weights, `mtp_num_hidden_layers`).
+    # Module level (not a closure): vLLM stores this callable in the draft ModelConfig, which is pickled.
+    if getattr(hf_config, "model_type", None) == MODEL_TYPE:
+        hf_config.model_type = "qwen3_5"
+    return _ORIG_HF_CONFIG_OVERRIDE(hf_config, *args, **kwargs)
+
+
+_hf_config_override._quantpack_sensenova = True
+
+
 def _register_mtp(logger):
+    global _ORIG_HF_CONFIG_OVERRIDE
     from vllm.config.speculative import SpeculativeConfig
 
     fn = SpeculativeConfig.hf_config_override
@@ -61,15 +76,8 @@ def _register_mtp(logger):
             return False          # vLLM maps it itself
     except (OSError, TypeError):
         pass
-
-    def hf_config_override(hf_config, *args, **kwargs):
-        # The SenseNova Loop MTP head is a Qwen3.5 MTP layer (mtp.* weights, `mtp_num_hidden_layers`).
-        if getattr(hf_config, "model_type", None) == MODEL_TYPE:
-            hf_config.model_type = "qwen3_5"
-        return fn(hf_config, *args, **kwargs)
-
-    hf_config_override._quantpack_sensenova = True
-    SpeculativeConfig.hf_config_override = staticmethod(hf_config_override)
+    _ORIG_HF_CONFIG_OVERRIDE = fn
+    SpeculativeConfig.hf_config_override = staticmethod(_hf_config_override)
     return True
 
 

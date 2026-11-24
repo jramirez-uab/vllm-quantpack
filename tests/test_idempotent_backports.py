@@ -76,3 +76,21 @@ def test_sensenova_mtp_mapping_only_rewrites_sensenova(monkeypatch):
     for mt in ("sensenova_loop", "qwen3_5"):
         Fake.hf_config_override(types.SimpleNamespace(model_type=mt))
     assert seen == ["qwen3_5", "qwen3_5"]
+
+
+def test_sensenova_mtp_mapping_is_picklable(monkeypatch):
+    """vLLM keeps hf_config_override in the draft ModelConfig, which is pickled for the engine process."""
+    import pickle
+
+    spec = pytest.importorskip("vllm.config.speculative")
+    from vllm_quantpack.families import sensenova
+
+    class Fake:
+        @staticmethod
+        def hf_config_override(hf_config, *a, **k):
+            return hf_config
+
+    monkeypatch.setattr(spec, "SpeculativeConfig", Fake)
+    monkeypatch.setattr(sensenova, "_ORIG_HF_CONFIG_OVERRIDE", None)
+    sensenova._register_mtp(None)
+    assert pickle.loads(pickle.dumps(Fake.hf_config_override)) is Fake.hf_config_override
