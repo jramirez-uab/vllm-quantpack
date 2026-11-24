@@ -38,6 +38,8 @@ _LAYERS: list = []            # index -> Exl3Inkling2Experts (the custom op only
 # Steps of up to this many tokens use the indexed, CUDA-graph capturable expert path (keep max_cudagraph_capture_size
 # at or below it); longer steps (prefill) use the per-expert loop
 GRAPH_TOKENS = int(os.environ.get("VLLM_QUANTPACK_INKLING2_GRAPH_TOKENS", "256"))
+# Steps of up to this many tokens use the fused decode kernel (coop.py), 8 rows per launch; 0 disables it
+COOP_TOKENS = int(os.environ.get("VLLM_QUANTPACK_INKLING2_COOP_TOKENS", "64"))
 
 
 def _is_exl3(layer) -> bool:
@@ -157,6 +159,7 @@ class Exl3Inkling2Experts(nn.Module):
         self.quant_method = _ExpertsPostLoad()
         self.exl3_idx = None
         self.prefix = ""
+        self.coop = None
 
     def build(self):
         device = torch.device("cuda", torch.cuda.current_device())
@@ -172,17 +175,53 @@ class Exl3Inkling2Experts(nn.Module):
             projs[proj] = _Proj(f"{self.prefix}.{proj}", per, device)
         self.gate, self.up, self.down = projs["gate_proj"], projs["up_proj"], projs["down_proj"]
         self.exl3_store.clear()
+        self._build_coop(device)
         self.exl3_idx = len(_LAYERS)
         _LAYERS.append(self)
 
+    def _build_coop(self, device):
+        g, u, d = self.gate, self.up, self.down
+        ks = {g.K, d.K}
+        if (COOP_TOKENS <= 0 or g.K != u.K or g.mcg != d.mcg or g.mul1 != d.mul1 or g.mcg != u.mcg
+                or any(not isinstance(k, int) for k in ks)
+                or any(n % 128 for n in (g.ic, g.oc, d.oc)) or g.ic != self.hidden_size):
+            return
+        from . import coop
+        mod = coop.load(ks)
+        if mod is not None:
+            self.coop = mod
+            self.coop_scratch = coop.Scratch.get(device, g.ic, g.oc, d.oc, self.topk)
+            self.coop_rows = coop.MAX_ROWS
+
     def compute(self, x, ids, gammas):
         T, k = ids.shape
+        if self.coop is not None and T <= COOP_TOKENS:
+            return self.compute_coop(x, ids, gammas)
         if T <= GRAPH_TOKENS:
             return self.compute_indexed(x, ids, gammas)
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(f"vllm-quantpack: Inkling2 EXL3 experts capture at most {GRAPH_TOKENS} tokens per step "
                                f"(got {T}); lower max_cudagraph_capture_size or raise VLLM_QUANTPACK_INKLING2_GRAPH_TOKENS")
         return self.compute_loop(x, ids, gammas)
+
+    def compute_coop(self, x, ids, gammas):
+        """Few tokens: exllamav3's fused decode MoE kernel with Inkling's softcapped SwiGLU (coop.py), up to 8 rows
+        per launch. Expert ids outside [0, E) (padding) contribute zeros. CUDA-graph capturable."""
+        T = ids.shape[0]
+        sc, g, u, d = self.coop_scratch, self.gate, self.up, self.down
+        xh = x.half()
+        sel = ids.long()
+        rw = gammas.half()
+        out = torch.empty((T, self.hidden_size), dtype=x.dtype, device=x.device)
+        for r0 in range(0, T, self.coop_rows):
+            r1 = min(T, r0 + self.coop_rows)
+            self.coop.inkling_moe_coop(
+                xh[r0:r1], sel[r0:r1], rw[r0:r1], 0, self.num_experts, g.ic,
+                g.p_trellis, g.p_suh, g.p_svh, u.p_trellis, u.p_suh, u.p_svh, d.p_trellis, d.p_suh, d.p_svh,
+                float(g.K), float(u.K), float(d.K), g.mcg, g.mul1, float(self.gate_cap), float(self.up_cap),
+                sc.had_g, sc.had_u, sc.gu_g, sc.gu_u, sc.act_out, sc.d_out, sc.ctr, sc.out)
+            out[r0:r1] = sc.out[:r1 - r0, :self.hidden_size]
+        return out
 
     def compute_indexed(self, x, ids, gammas):
         """Few tokens (decode, MTP verification): one slot per (token, expert) assignment in exllamav3's indexed
@@ -269,6 +308,116 @@ class _MoE(_OrigMoE):
 
 
 _model.Inkling2MoE = _MoE
+
+
+# --- DSpark MTP draft on an EXL3 target ----------------------------------------------------------------------------
+# The draft shares the target's lm_head and reads its dense `.weight` twice: to fold its recurrent head into the
+# vocabulary (W @ P, once at load) and for the base logits of every draft step. With an EXL3 head both go through
+# the EXL3 GEMM instead (W @ P = lm_head(P^T)^T), so no dense copy of the 201k x 2304 head is kept. Only the draft's
+# proposals change; the target verifies every token.
+from vllm.models.inkling2.nvidia import dspark as _dspark   # noqa: E402
+
+_DSpark = _dspark.Inkling2DSparkModel
+_orig_attach = _DSpark.attach_target
+_orig_refresh = _DSpark.refresh_derived_weights
+_orig_base_logits = _DSpark.compute_base_logits
+
+
+def _exl3_head(model):
+    head = getattr(model, "lm_head", None)
+    qm = getattr(head, "quant_method", None)
+    return head if qm is not None and type(qm).__module__.startswith("vllm_quantpack") else None
+
+
+def _head_apply(head, x):
+    return head.quant_method.apply(head, x)
+
+
+@torch.no_grad()
+def _fold_exl3(markov, head, dtype):
+    """MarkovHead.fold with the EXL3 head: fold_weight = W @ P, fold_bias = W @ b (fp32 GEMM accumulation)."""
+    p = markov.hidden_out.weight.to(dtype)                    # (hidden, rank)
+    b = markov.hidden_out.bias.to(dtype)                      # (hidden,)
+    wp = _head_apply(head, p.t().contiguous()).t()            # (vocab, rank)
+    wb = _head_apply(head, b[None].contiguous())[0]           # (vocab,)
+    if markov.fold_weight is None or markov.fold_bias is None:
+        markov.fold_weight = torch.empty(wp.shape, dtype=dtype, device=wp.device)
+        markov.fold_bias = torch.empty(wb.shape, dtype=dtype, device=wb.device)
+    markov.fold_weight.copy_(wp)
+    markov.fold_bias.copy_(wb)
+
+
+@torch.no_grad()
+def _attach_target(self, target_model):
+    if os.environ.get("VLLM_QUANTPACK_DSPARK_DIAG") == "1":
+        from collections import Counter
+        kinds = Counter(type(m.quant_method).__name__ for _, m in self.named_modules()
+                        if getattr(m, "quant_method", None) is not None)
+        emb = self.model.embed_tokens
+        print(f"vllm-quantpack DSPARK-DIAG: draft quant methods {dict(kinds)}; embed_tokens "
+              f"{type(emb).__name__} / {type(getattr(emb, 'quant_method', None)).__name__}", flush=True)
+        for n, p in list(self.named_parameters())[:12]:
+            print(f"vllm-quantpack DSPARK-DIAG: {n} {tuple(p.shape)} {p.dtype} |p| {p.float().norm().item():.3f}", flush=True)
+    if _exl3_head(self) is None:
+        return _orig_attach(self, target_model)
+    self.model.embed_norm = target_model.model.embed_norm
+    head = self.model.markov_head
+    head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
+    self.refresh_derived_weights()
+
+
+@torch.no_grad()
+def _dense_head_weight(head, dtype=torch.bfloat16):
+    """The EXL3 head as a dense (vocab, hidden) matrix: lm_head(I) = W^T (diagnostics only, ~0.9 GB)."""
+    p = next((t for t in head.parameters()), None)
+    dev = p.device if p is not None else torch.device("cuda")
+    eye = torch.eye(head.embedding_dim, dtype=dtype, device=dev)
+    return _head_apply(head, eye).t().contiguous()
+
+
+@torch.no_grad()
+def _refresh_derived_weights(self):
+    head = _exl3_head(self)
+    if head is None:
+        return _orig_refresh(self)
+    markov = self.model.markov_head
+    if os.environ.get("VLLM_QUANTPACK_DSPARK_DIAG") == "1":
+        w = _dense_head_weight(head)
+        proj, bias = markov.hidden_out.weight.double(), markov.hidden_out.bias.double()
+        ref_w = (w.double() @ proj)
+        ref_b = (w.double() @ bias)
+        _fold_exl3(markov, head, torch.bfloat16)
+        ew = ((markov.fold_weight.double() - ref_w).norm() / ref_w.norm()).item()
+        eb = ((markov.fold_bias.double() - ref_b).norm() / ref_b.norm()).item()
+        print(f"vllm-quantpack DSPARK-DIAG: head {tuple(w.shape)} fold_weight {tuple(markov.fold_weight.shape)} "
+              f"rel err {ew:.3e}, fold_bias rel err {eb:.3e}; |W| {w.float().norm().item():.2f} "
+              f"|P| {proj.norm().item():.3f} |b| {bias.norm().item():.3f}", flush=True)
+        if os.environ.get("VLLM_QUANTPACK_DSPARK_DENSE") == "1":
+            self._qp_dense_head = w
+            markov.fold_weight, markov.fold_bias = None, None
+            markov.fold(w)
+            print("vllm-quantpack DSPARK-DIAG: draft uses the DENSE head", flush=True)
+        else:
+            del w
+    else:
+        _fold_exl3(markov, head, torch.bfloat16)
+    markov.rnn_bias.copy_(markov.rnn_proj.bias)
+    self.model.fuse_alpha.copy_(torch.softmax(self.model.fuse_weight.float(), dim=-1))
+
+
+def _compute_base_logits(self, hidden_states):
+    head = _exl3_head(self)
+    if head is None:
+        return _orig_base_logits(self, hidden_states)
+    dense = getattr(self, "_qp_dense_head", None)
+    if dense is not None:
+        return torch.nn.functional.linear(hidden_states, dense)
+    return _head_apply(head, hidden_states).to(hidden_states.dtype)
+
+
+_DSpark.attach_target = _attach_target
+_DSpark.refresh_derived_weights = _refresh_derived_weights
+_DSpark.compute_base_logits = _compute_base_logits
 
 
 # --- the model ------------------------------------------------------------------------------------------------------------
