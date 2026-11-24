@@ -443,6 +443,14 @@ class Inkling2LoopForConditionalGeneration(_Base):
             return
         if vllm_config.parallel_config.tensor_parallel_size != 1:
             raise NotImplementedError("vllm-quantpack: EXL3 Inkling2 runs on one GPU")
+        from . import kvq
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype in kvq.DTYPES:
+            reason = kvq.install()
+            if reason:
+                raise ValueError(f"vllm-quantpack: Inkling2 KV cache {cache_dtype} unavailable: {reason}")
+        elif cache_dtype.startswith("fp8") and not kvq.native_e4m3():
+            kvq.install()       # fast software e4m3 reads; on failure the stock kernels stay
         token = _EXL3.set(qc)
         vllm_config.quant_config = None
         try:
