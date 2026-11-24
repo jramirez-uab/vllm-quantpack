@@ -6,7 +6,7 @@ whose config says `quant_method: "exl3"` with no flag and no patch to vLLM.
 Layout:
   exl3/      quantization config, linear / embedding / MoE methods, the custom ops, tensor-parallel cuts
   families/  fixes for specific model families (Qwen vision and Flash-Next PLE) and models vLLM lacks or
-             maps incompletely (Flint, Spark, Nemotron-3.5-Super-VL, Inkling2 from an EXL3 pack)
+             maps incompletely (Flint, Spark, Nemotron-3.5-Super-VL, Inkling2 from an EXL3 pack, SenseNova Loop)
 
 It replaces OrcaSAQ2 (whose code it includes, Apache-2.0), qwen38_exl3_vision, flint_vllm and spark_vllm, which must
 not be installed alongside.
@@ -51,7 +51,7 @@ def register():
     from .attention.int4_kv import patch_int4_kv
     from .attention.turboquant_kv import patch_turboquant_kv
     from .exl3.spec_decode import patch_should_share
-    from .families import flint, inkling2, nemotron, qwen, spark
+    from .families import flint, inkling2, nemotron, qwen, sensenova, spark
     patch_should_share(logger)
     patch_int4_kv(logger)
     patch_turboquant_kv(logger)
@@ -64,4 +64,5 @@ def register():
         logger.info("vllm-quantpack: Nemotron-3.5-Super-VL model registered")
     if inkling2.register(logger):
         logger.info("vllm-quantpack: Inkling2 (EXL3) model registered")
+    sensenova.register(logger)
     logger.info("vllm-quantpack %s: quant_method 'exl3' is loadable (linear, int8 embedding, MoE, TP)", __version__)
