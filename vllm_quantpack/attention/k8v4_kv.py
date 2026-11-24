@@ -137,9 +137,10 @@ def patch_backend(stock, logger):
         if self.kv_cache_dtype != NAME:
             return stock_scales(self, kv_cache)
         if self._k_scale_cache is None:
+            # No fill: like vLLM's own per-token-head caches, each scale is written with its token before any
+            # unmasked read, and an extensible KV cache backs only a prefix of the blocks during warmup, so
+            # touching the whole view faults (illegal memory access with --gpu-memory-utilization).
             _, _, ks, vs = views(kv_cache, self.head_size)
-            ks.fill_(1.0)
-            vs.fill_(1.0)
             self._k_scale_cache, self._v_scale_cache = ks, vs
 
     def _pth_key_value_caches(self, kv_cache):
