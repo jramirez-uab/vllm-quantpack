@@ -14,7 +14,16 @@ model-family fixes they need, in stock vLLM: no patch to vLLM, no per-model plug
   - tensor parallelism for dense layers (`-tp N`) and expert parallelism for MoE (`-tp N --enable-expert-parallel`).
 - Model-family fixes:
   - **Qwen 3.5 / 3.6 / 3.8**: the vision tower's duplicated attention tensors;
-  - **Qwen3.8-Flash-Next**: the FP8 PLE lookup on GPUs below sm_89.
+  - **Qwen3.8-Flash-Next**: the FP8 PLE lookup on GPUs below sm_89;
+  - **SenseNova Loop** (`SenseNovaLoopForConditionalGeneration`, e.g. SenseNova-Loop-9B): the model from vLLM PR
+    [#64832](https://github.com/vllm-project/vllm/pull/64832), which stock vLLM 0.34 does not ship, plus what an EXL3
+    pack needs: the looped layers sharing one set of EXL3 tensors, the vision tower and the model's own MTP head.
+    Registered only when vLLM lacks it; `VLLM_QUANTPACK_SENSENOVA=force` uses this one over a vLLM that has its own;
+  - **Inkling 2** (`Inkling2LoopForConditionalGeneration`, e.g. Inkling-2-Mini, vLLM nightly): EXL3 packs, including
+    the routed experts with the model's softcapped SwiGLU on a fused decode kernel, DSpark MTP with an EXL3 main model,
+    and `int4_per_token_head` / `k8v4_per_token_head` KV caches in its attention. On GPUs below sm_90 it also loads
+    Ampere versions of the nightly's Inkling 2 CUDA modules, only when vLLM is the exact nightly they were written
+    against (`0.34.0rc1.dev1136+gcb19fedd8`, checked by SHA-256 of each file); any other vLLM build is left alone.
 - vLLM's int4 KV cache (`--kv-cache-dtype int4_per_token_head`, TRITON_ATTN backend), made exact and fast enough to
   serve 262k-token sessions: see [int4 KV cache](#int4-kv-cache).
 - vLLM's TurboQuant KV cache (`--kv-cache-dtype turboquant_k8v4` and the other presets), made correct with
@@ -186,13 +195,17 @@ environment, uninstall it, or load only this plugin with `VLLM_PLUGINS=quantpack
 | GPTQ with int4/int8 embeddings (Qwen3.5 family, vLLM <= 0.31) | validated: loads on unpatched vLLM 0.31, bit-identical to the patched vLLM in eager mode |
 | Spark architecture | served (Spark-X2.5 4B) |
 | Nemotron-3.5-Super-VL (gateless ReLU² MoE, MTP, vision) | served (2.25 bpw, one 96 GB GPU) |
+| SenseNova Loop (EXL3, vision, MTP) | served on stock vLLM 0.34.0: 262,144 tokens, 2 sessions in 24 GB with `k8v4_per_token_head`; logits identical to the patched PR build (same top-1 agreement and mean \|dlogprob\| on the reference prompt) |
+| Inkling 2 (EXL3, vision, DSpark MTP) | served on the vLLM nightly above (A40 and RTX 3090): 262,144 tokens with `k8v4_per_token_head` and MTP 7; logits match the patched nightly build (top-1 2870/2873, mean \|dlogprob\| 0.006) |
 | Every published JRamirez-UAB checkpoint | each served with its card's Quick start command on a clean vLLM 0.31 + exllamav3 1.5.1 install: text, image and tool call answered |
 
 ## Credits
 
 Includes code from [OrcaSAQ2](https://github.com/Continuum-AI-Corp/OrcaSAQ2-kernel) (Apache-2.0). The EXL3 format and
 kernels are [exllamav3](https://github.com/turboderp-org/exllamav3) by turboderp (MIT), a streamlined variant of
-[QTIP](https://github.com/Cornell-RelaxML/qtip). See NOTICE.
+[QTIP](https://github.com/Cornell-RelaxML/qtip). The SenseNova Loop model is adapted from vLLM PR
+[#64832](https://github.com/vllm-project/vllm/pull/64832), and the Inkling 2 Ampere modules from the vLLM nightly's
+`vllm/models/inkling2` (vLLM, Apache-2.0). See NOTICE.
 
 ## License
 
