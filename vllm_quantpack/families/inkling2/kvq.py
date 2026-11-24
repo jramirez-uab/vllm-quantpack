@@ -36,7 +36,7 @@ import torch
 log = logging.getLogger(__name__)
 
 DTYPES = {"k8v4_per_token_head": 1, "int4_per_token_head": 2}
-PACKED_BLOCK = int(os.environ.get("VLLM_QUANTPACK_INKLING2_KV_BLOCK", "4096"))   # tokens per block, packed caches
+PACKED_BLOCK = int(os.environ.get("VLLM_QUANTPACK_INKLING2_KV_BLOCK", "1024"))   # tokens per block, packed caches
 _OPS = "vllm.models.inkling2.nvidia.ops"
 _lock = threading.Lock()
 _state: dict = {}
@@ -372,6 +372,35 @@ def _install() -> None:
         assert rows.shape[-1] == row_bytes(self._qp_kvq, self.head_dim), rows.shape
         return rows, rows
 
+    # vLLM grows a smaller page to the largest one only by whole multiples. The packed pages (1024 tokens x 1088 or
+    # 1600 bytes = 17 or 25 x 64 KiB) are multiples of 64 KiB, but the other layers come with the platform's block
+    # (64 tokens: 256 KiB bf16 draft pages), so they would be padded. Starting those layers from the smallest block
+    # their kernels take (16 tokens for the FlashAttention draft, 64 KiB pages) lets vLLM grow them exactly instead.
+    # With 4096-token blocks every per-request window and conv-tail allocation is 4x larger (a 262k request took
+    # 1437 x 4.46 MB; 1024 gives 4194 x 1.11 MB = 4.67 GB, about 27 % less).
+    import dataclasses
+    from vllm.v1.core import kv_cache_planning as kvp
+    pre_unify = kvp.unify_kv_cache_spec_page_size
+
+    def unify_packed(layer_configs):
+        packed = [lc.spec.page_size_bytes for lc in layer_configs.values()
+                  if lc.spec.dtype == torch.uint8 and lc.spec.block_size >= PACKED_BLOCK]
+        if packed:
+            top = max(packed)
+            for name, lc in list(layer_configs.items()):
+                sp = lc.spec
+                if (sp.dtype == torch.uint8 or top % sp.page_size_bytes == 0 or getattr(sp, "page_size_padded", None)
+                        or not hasattr(sp, "num_kv_heads")):
+                    continue
+                per_token = sp.page_size_bytes // sp.block_size
+                b = sp.block_size
+                while top % (per_token * b) and b % 2 == 0 and b // 2 >= 16:
+                    b //= 2
+                if b != sp.block_size and top % (per_token * b) == 0:
+                    layer_configs[name] = dataclasses.replace(lc, spec=dataclasses.replace(sp, block_size=b))
+        return pre_unify(layer_configs)
+    kvp.unify_kv_cache_spec_page_size = unify_packed
+
     if os.environ.get("VLLM_QUANTPACK_KV_DEBUG") == "1":     # log the per-layer specs vLLM unifies
         from collections import Counter
         from vllm.v1.core import kv_cache_planning as kvp
@@ -386,6 +415,16 @@ def _install() -> None:
                 log.warning("vllm-quantpack KV-DEBUG %s: %s", tag, sorted(c.items(), key=str))
             return out
         kvp.unify_kv_cache_spec_page_size = unify
+        from vllm.v1.core import kv_cache_utils as kvu
+        stock_conc = kvu.get_max_concurrency_for_kv_cache_config
+
+        def conc(vllm_config, kv_cache_config):      # blocks each group takes for one max_model_len request
+            rows = Counter((g.manager_cls.__name__, len(g.kv_cache_specs), g.block_size, g.page_size_bytes,
+                            g.max_allocated_blocks_per_request(vllm_config)) for g in kv_cache_config.kv_cache_groups)
+            log.warning("vllm-quantpack KV-DEBUG groups (manager, layers, block, group page, blocks/request): %s; "
+                        "num_blocks %d", sorted(rows.items(), key=str), kv_cache_config.num_blocks)
+            return stock_conc(vllm_config, kv_cache_config)
+        kvu.get_max_concurrency_for_kv_cache_config = conc
 
     att._kv_cache_layer_config = _kv_cache_layer_config
     att.Inkling2Attention.__init__ = __init__
