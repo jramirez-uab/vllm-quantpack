@@ -36,6 +36,7 @@ import torch
 log = logging.getLogger(__name__)
 
 DTYPES = {"k8v4_per_token_head": 1, "int4_per_token_head": 2}
+PACKED_BLOCK = int(os.environ.get("VLLM_QUANTPACK_INKLING2_KV_BLOCK", "4096"))   # tokens per block, packed caches
 _OPS = "vllm.models.inkling2.nvidia.ops"
 _lock = threading.Lock()
 _state: dict = {}
@@ -313,7 +314,12 @@ def _install() -> None:
         mode = DTYPES.get(vllm_config.cache_config.cache_dtype)
         if not mode:
             return stock_layer_config(vllm_config, num_kv_heads, head_dim, sliding_window)
-        spec = AttentionSpec(block_size=vllm_config.cache_config.block_size, num_kv_heads=num_kv_heads,
+        # vLLM gives every layer one page size: a smaller page grows its block only when it divides the largest
+        # page exactly, else it is padded to it. Next to the DSpark draft's bf16 pages (64 x 8 x 512 bytes) the
+        # 136 / 200-byte rows would be padded back to 512. Blocks of PACKED_BLOCK tokens make these pages exact
+        # multiples of the draft's (4096-token blocks: 17x int4, 25x k8v4), so the draft's block grows instead.
+        block = max(vllm_config.cache_config.block_size, PACKED_BLOCK)
+        spec = AttentionSpec(block_size=block, num_kv_heads=num_kv_heads,
                              head_size=row_bytes(mode, head_dim) // 2, dtype=torch.uint8)
         if sliding_window is not None:
             return att.SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
@@ -345,6 +351,21 @@ def _install() -> None:
         rows = att.canonicalize_singleton_dim_strides(kv_cache.view(torch.uint8).transpose(1, 2))
         assert rows.shape[-1] == row_bytes(self._qp_kvq, self.head_dim), rows.shape
         return rows, rows
+
+    if os.environ.get("VLLM_QUANTPACK_KV_DEBUG") == "1":     # log the per-layer specs vLLM unifies
+        from collections import Counter
+        from vllm.v1.core import kv_cache_planning as kvp
+        stock_unify = kvp.unify_kv_cache_spec_page_size
+
+        def unify(layer_configs):
+            out = stock_unify(layer_configs)
+            for tag, cfgs in (("in", layer_configs), ("out", out)):
+                c = Counter((type(v.spec).__name__, v.spec.block_size, v.spec.page_size_bytes,
+                             getattr(v.spec, "page_size_padded", None), getattr(v.spec, "sliding_window", None))
+                            for v in cfgs.values())
+                log.warning("vllm-quantpack KV-DEBUG %s: %s", tag, sorted(c.items(), key=str))
+            return out
+        kvp.unify_kv_cache_spec_page_size = unify
 
     att._kv_cache_layer_config = _kv_cache_layer_config
     att.Inkling2Attention.__init__ = __init__
