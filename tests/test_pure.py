@@ -134,3 +134,35 @@ def test_expert_store_key_maps_fused_parameter_names():
     assert expert_store_key("experts.w2_svh", "w2", 0) == (0, "down_proj", "svh")
     assert expert_store_key("experts.w2_weight", "w2", 0) is None
     assert expert_store_key("experts.e_score_correction_bias", None, 0) is None
+
+
+def test_expand_inkling2_qkvr_in_vllm_shard_order():
+    # vLLM Inkling2 fuses six projections into attn.qkvr, shard ids 0..5 in this order (model.py _shards)
+    assert expand("model.layers.3.attn.qkvr") == [
+        "model.layers.3.attn.wq_du", "model.layers.3.attn.wr_du", "model.layers.3.attn.gate_attn",
+        "model.layers.3.attn.attn_sink_proj", "model.layers.3.attn.wk_dv", "model.layers.3.attn.wv_dv"]
+
+
+def test_norm_prefix_matches_inkling2_pack_and_vllm_names():
+    # the pack keeps the checkpoint tree (model.llm.), vLLM renames it to model.
+    assert norm_prefix("model.llm.layers.3.attn.wq_du") == norm_prefix("model.layers.3.attn.wq_du")
+    assert norm_prefix("model.llm.unembed") == "unembed"
+
+
+def test_mixed_slots_plans_each_output_partition():
+    from vllm_quantpack.exl3.names import mixed_slots
+    # Inkling2 qkvr: five trellis shards, a dense attn_sink_proj (slot 3) and an empty alignment pad (slot 6)
+    plan = mixed_slots({0: 64, 1: 32, 2: 16, 4: 32, 5: 32}, {3: 8}, [64, 32, 16, 8, 32, 32, 4])
+    assert plan == [("t", 0), ("t", 1), ("t", 2), ("d", 3), ("t", 4), ("t", 5), ("z", 4)]
+
+
+def test_mixed_slots_rejects_a_missing_shard_that_is_not_the_last():
+    from vllm_quantpack.exl3.names import mixed_slots
+    with pytest.raises(ValueError):
+        mixed_slots({0: 64, 2: 16}, {}, [64, 32, 16])
+
+
+def test_mixed_slots_rejects_a_shard_of_the_wrong_width():
+    from vllm_quantpack.exl3.names import mixed_slots
+    with pytest.raises(ValueError):
+        mixed_slots({0: 64}, {1: 30}, [64, 32])

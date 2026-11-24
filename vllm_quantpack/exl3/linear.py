@@ -32,7 +32,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 
 from . import hooks
 from . import ops  # noqa: F401  (registers quantpack::exl3_gemm)
-from .names import expand, manifest_prefixes, norm_prefix, slot, trellis_k
+from .names import expand, manifest_prefixes, mixed_slots, norm_prefix, slot, trellis_k
 from .tp_ranges import col_ranges, logical_parts, on_block, padded_shard_cols, row_range
 
 logger = init_logger("vllm.quantpack.exl3")
@@ -212,6 +212,10 @@ class Exl3LinearMethod(LinearMethodBase):
                    torch.device("cuda", torch.cuda.current_device()))
         layer.exl3_shards = None
         layer.exl3_dense = None
+        layer.exl3_mixed = None
+        if tr and dense:
+            self._load_mixed(layer, tr, suh, svh, mcg, mul1, dense, sel, dev)
+            return
         if not tr:
             if not dense:
                 if self.prefix.endswith("lm_head"):
@@ -248,6 +252,34 @@ class Exl3LinearMethod(LinearMethodBase):
         release(layer, LINEAR_SUFFIXES)
         if sel is not None:
             layer.exl3_col_sel = torch.tensor(sel, dtype=torch.long, device=dev)
+        for hook in hooks.LINEAR:
+            hook(self.prefix, layer)
+
+    def _load_mixed(self, layer, tr, suh, svh, mcg, mul1, dense, sel, dev):
+        """A fused layer with EXL3 and dense shards (Inkling2 attn.qkvr: attn_sink_proj stays BF16), and possibly an
+        unfilled last partition (its 8-alignment pad, computed as zeros). Single GPU only."""
+        if layer.exl3_tp is not None or sel is not None:
+            raise NotImplementedError(f"{self.prefix}: tensor parallelism with EXL3 and dense shards in one layer")
+        try:
+            plan = mixed_slots({i: svh[i].numel() for i in tr}, {i: dense[i].shape[0] for i in dense},
+                               layer.exl3_out_sizes)
+        except ValueError as e:
+            raise RuntimeError(f"{self.prefix}: {e}") from None
+        from vllm.config import get_current_vllm_config
+        dt = get_current_vllm_config().model_config.dtype
+        mixed = []
+        for kind, v in plan:
+            if kind == "t":
+                mixed.append(("t", dict(trellis=tr[v].contiguous().to(dev), suh=suh[v].to(dev, torch.half).contiguous(),
+                                        svh=svh[v].to(dev, torch.half).contiguous(), mcg=mcg.get(v) is not None,
+                                        mul1=mul1.get(v) is not None, K=trellis_k(tr[v].shape[-1]),
+                                        ic=suh[v].numel(), oc=svh[v].numel())))
+            elif kind == "d":
+                mixed.append(("d", dense[v].contiguous().to(dev, dt)))
+            else:
+                mixed.append(("z", v))
+        layer.exl3_mixed = mixed
+        release(layer, LINEAR_SUFFIXES)
         for hook in hooks.LINEAR:
             hook(self.prefix, layer)
 
@@ -319,7 +351,38 @@ class Exl3LinearMethod(LinearMethodBase):
         return out + bias if bias is not None else out
 
     @staticmethod
+    def partitions(layer, x, which):
+        """Outputs of the output partitions `which` of a mixed fused layer, each (..., width), computed on x alone
+        (a model that feeds different inputs to different partitions, as Inkling2's full-attention q/k/v)."""
+        return Exl3LinearMethod._forward_mixed(layer, x, which, split=True)
+
+    @staticmethod
+    def _forward_mixed(layer, x, which=None, split=False):
+        rows = x.numel() // x.shape[-1]
+        x2 = x.reshape(rows, x.shape[-1])
+        xf = None
+        outs = []
+        for i, (kind, v) in enumerate(layer.exl3_mixed):
+            if which is not None and i not in which:
+                continue
+            if kind == "t":
+                if xf is None:
+                    xf = x2.half().contiguous()
+                outs.append(torch.ops.quantpack.exl3_gemm(xf, v["trellis"], v["suh"], v["svh"], v["oc"], float(v["K"]),
+                                                          v["mcg"], v["mul1"]).to(x.dtype))
+            elif kind == "d":
+                outs.append(F.linear(x2, v.to(x.dtype)))
+            else:
+                outs.append(x2.new_zeros((rows, v)))
+        if split:
+            return [o.reshape(*x.shape[:-1], o.shape[-1]) for o in outs]
+        out = torch.cat(outs, dim=-1)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+
+    @staticmethod
     def _forward(layer, x):
+        if getattr(layer, "exl3_mixed", None) is not None:
+            return Exl3LinearMethod._forward_mixed(layer, x)
         if layer.exl3_shards is None:
             return F.linear(x, layer.exl3_dense.to(x.dtype))   # a no-op: converted to the model dtype at load
         sh = layer.exl3_shards

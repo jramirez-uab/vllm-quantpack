@@ -18,6 +18,18 @@ import contextvars
 import inspect
 
 _pending_embed = contextvars.ContextVar("quantpack_pending_embed", default=None)
+# Set by a family that builds its model with vllm_config.quant_config hidden (Inkling2 asserts its own config class).
+_exl3_override = contextvars.ContextVar("quantpack_exl3_override", default=None)
+
+
+@contextlib.contextmanager
+def exl3_config_override(qc):
+    """While a family builds its layers: the EXL3 config to supply, whatever vllm_config.quant_config says."""
+    token = _exl3_override.set(qc)
+    try:
+        yield
+    finally:
+        _exl3_override.reset(token)
 
 
 @contextlib.contextmanager
@@ -49,7 +61,7 @@ def _current_quant_config():
 
 def _current_exl3_config():
     from .linear import Exl3Config
-    qc = _current_quant_config()
+    qc = _exl3_override.get() or _current_quant_config()
     return qc if isinstance(qc, Exl3Config) else None
 
 

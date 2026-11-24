@@ -10,6 +10,7 @@ SHARD_IDS = {
     "qkv_proj": ["q", "k", "v"],
     "gate_up_proj": [0, 1],
     "in_proj_qkvz": [0, 1],
+    "qkvr": [0, 1, 2, 3, 4, 5],
 }
 
 # Fused vLLM name -> the HF names its shards came from.
@@ -17,11 +18,14 @@ FUSED_TO_HF = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
     "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    # Inkling2 attention (vLLM models/inkling2, model.py _shards); attn_sink_proj stays BF16 in an EXL3 pack
+    "qkvr": ["wq_du", "wr_du", "gate_attn", "attn_sink_proj", "wk_dv", "wv_dv"],
 }
 
 # Multimodal models add tree segments ("language_model.model.") that the pack manifest does not have ("backbone.",
-# "model."); both sides are compared without them.
-_LEADS = ("language_model.model.", "language_model.backbone.", "model.", "backbone.")
+# "model."); both sides are compared without them. Inkling2 packs keep the checkpoint tree "model.llm." that vLLM
+# renames to "model.", so it is stripped before "model.".
+_LEADS = ("language_model.model.", "language_model.backbone.", "model.llm.", "model.", "backbone.")
 
 
 def slot(shard_id) -> int:
@@ -51,6 +55,28 @@ def norm_prefix(prefix: str) -> str:
         if prefix.startswith(lead):
             return prefix[len(lead):]
     return prefix
+
+
+def mixed_slots(trellis_oc: dict, dense_oc: dict, out_sizes: list) -> list:
+    """Plan of a fused layer whose shards are not all of one kind, one entry per output partition, in order:
+    ("t", slot) an EXL3 shard, ("d", slot) a dense weight, ("z", width) zero columns. Only the LAST partition may be
+    missing (the alignment pad of Inkling2's qkvr, which no checkpoint tensor fills); every shard must have its
+    partition's width. trellis_oc / dense_oc map slot -> output columns."""
+    plan = []
+    for s, width in enumerate(out_sizes):
+        if s in trellis_oc or s in dense_oc:
+            kind, got = ("t", trellis_oc[s]) if s in trellis_oc else ("d", dense_oc[s])
+            if got != width:
+                raise ValueError(f"shard {s} has {got} output columns, its partition has {width}")
+            plan.append((kind, s))
+        elif s == len(out_sizes) - 1:
+            plan.append(("z", width))
+        else:
+            raise ValueError(f"partition {s} of {len(out_sizes)} has no shard (only the last one may be a pad)")
+    extra = set(trellis_oc) | set(dense_oc)
+    if extra - set(range(len(out_sizes))):
+        raise ValueError(f"shards {sorted(extra - set(range(len(out_sizes))))} beyond the {len(out_sizes)} partitions")
+    return plan
 
 
 def manifest_prefixes(tensor_storage: dict) -> set[str]:
