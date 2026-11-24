@@ -97,20 +97,40 @@ def _kvq_rotate(x, ROWS: tl.constexpr, D: tl.constexpr):
 
 
 @triton.jit
+def _kvq_words(ptr, offsets, mask, W: tl.constexpr):
+    """[N, W] int32 words of each row (rows are 4-byte aligned: wide loads instead of one byte per element)."""
+    base = (ptr + tl.multiple_of(offsets, 4)).to(tl.pointer_type(tl.int32))
+    return tl.load(base[:, None] + tl.arange(0, W)[None, :], mask=mask[:, None], other=0)
+
+
+@triton.jit
 def _kvq_int8(ptr, offsets, mask, D: tl.constexpr, S_OFF: tl.constexpr):
     """[N, D] fp32 keys of int8 rows at byte `offsets` (fp16 scale at S_OFF)."""
-    d = tl.arange(0, D)
-    x = tl.load(ptr + offsets[:, None] + d[None, :], mask=mask[:, None], other=0)
+    w = _kvq_words(ptr, offsets, mask, D // 4)
+    b0 = ((w << 24) >> 24).to(tl.float32)
+    b1 = ((w << 16) >> 24).to(tl.float32)
+    b2 = ((w << 8) >> 24).to(tl.float32)
+    b3 = (w >> 24).to(tl.float32)
+    x = tl.reshape(tl.join(tl.join(b0, b2), tl.join(b1, b3)), [offsets.shape[0], D])
     s = tl.load((ptr + offsets + S_OFF).to(tl.pointer_type(tl.float16)), mask=mask, other=0.0)
-    return x.to(tl.int8, bitcast=True).to(tl.float32) * s.to(tl.float32)[:, None]
+    return x * s.to(tl.float32)[:, None]
 
 
 @triton.jit
 def _kvq_int4(ptr, offsets, mask, D: tl.constexpr, S_OFF: tl.constexpr):
     """[N, D] fp32 values of nibble rows at byte `offsets` (fp16 scale and minimum at S_OFF)."""
-    half = tl.arange(0, D // 2)
-    b = tl.load(ptr + offsets[:, None] + half[None, :], mask=mask[:, None], other=0)
-    x = tl.interleave((b & 15).to(tl.float32), (b >> 4).to(tl.float32))
+    w = _kvq_words(ptr, offsets, mask, D // 8)
+    a0 = (w & 15).to(tl.float32)
+    a1 = ((w >> 4) & 15).to(tl.float32)
+    a2 = ((w >> 8) & 15).to(tl.float32)
+    a3 = ((w >> 12) & 15).to(tl.float32)
+    a4 = ((w >> 16) & 15).to(tl.float32)
+    a5 = ((w >> 20) & 15).to(tl.float32)
+    a6 = ((w >> 24) & 15).to(tl.float32)
+    a7 = ((w >> 28) & 15).to(tl.float32)
+    # word k holds channels 8k..8k+7 (nibble i = channel 8k+i); join from the high bit of i down to bit 0
+    x = tl.join(tl.join(tl.join(a0, a4), tl.join(a2, a6)), tl.join(tl.join(a1, a5), tl.join(a3, a7)))
+    x = tl.reshape(x, [offsets.shape[0], D])
     sp = (ptr + offsets + S_OFF).to(tl.pointer_type(tl.float16))
     s = tl.load(sp, mask=mask, other=0.0).to(tl.float32)
     z = tl.load(sp + 1, mask=mask, other=0.0).to(tl.float32)
@@ -151,14 +171,14 @@ _ATT_EDITS = [
     ("launcher mode", "    page, num_kv_heads = key_cache.shape[1:3]\n",
      "    page, num_kv_heads = key_cache.shape[1:3]\n    kvq = kvq_mode(key_cache.shape[3], head_dim)\n"),
     # Prefill tiles (block_m 128) per cache format, measured on an RTX 3090 (port/bench_rel_attn.py, 8192 queries,
-    # 16k context): fp8 with software reads 64x32/4 warps (29.6 ms vs 32.5), k8v4 64x64/4 (34.8 vs 65.8); bf16 and
-    # int4 keep 128x64/8. Decode tiles are unchanged.
+    # 16k context, packed rows read as int32 words): fp8 with software reads 64x32/4 warps (29.6 ms vs 32.5), int4
+    # 128x32/8 (31.5 vs 34.2; byte reads took 50.1), k8v4 keeps 128x64/8 (33.0) like bf16. Decode tiles unchanged.
     ("prefill tiles", "    block_m = _block_m(max_query_len, group)\n",
      "    block_m = _block_m(max_query_len, group)\n"
      "    block_n = 64 if block_m >= 128 else 128 if block_m <= 32 else 64\n"
      "    warps = 8 if block_m >= 128 else 4\n"
-     "    if block_m == 128 and kvq == 1:\n"
-     "        block_m, block_n, warps = 64, 64, 4\n"
+     "    if block_m == 128 and kvq >= 2:\n"
+     "        block_n = 32\n"
      "    elif block_m == 128 and kvq == 0 and key_cache.element_size() == 1 and not native_e4m3():\n"
      "        block_m, block_n, warps = 64, 32, 4\n"),
     ("launch KVQ", "        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,\n"
