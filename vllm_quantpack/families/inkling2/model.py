@@ -13,6 +13,7 @@ What changes when the pack is EXL3 (vllm_config.quant_config is an Exl3Config); 
     and gives the rest to vLLM's loader.
 """
 import contextlib
+import os
 import contextvars
 import re
 
@@ -34,6 +35,9 @@ _EXL3 = contextvars.ContextVar("quantpack_inkling2_exl3", default=None)
 _EXPERT = re.compile(r"^(?P<mod>.*\.mlp\.experts)\.(?P<e>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\."
                      r"(?P<suf>trellis|suh|svh|mcg|mul1)$")
 _LAYERS: list = []            # index -> Exl3Inkling2Experts (the custom op only receives the index)
+# Steps of up to this many tokens use the indexed, CUDA-graph capturable expert path (keep max_cudagraph_capture_size
+# at or below it); longer steps (prefill) use the per-expert loop
+GRAPH_TOKENS = int(os.environ.get("VLLM_QUANTPACK_INKLING2_GRAPH_TOKENS", "256"))
 
 
 def _is_exl3(layer) -> bool:
@@ -172,6 +176,40 @@ class Exl3Inkling2Experts(nn.Module):
         _LAYERS.append(self)
 
     def compute(self, x, ids, gammas):
+        T, k = ids.shape
+        if T <= GRAPH_TOKENS:
+            return self.compute_indexed(x, ids, gammas)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"vllm-quantpack: Inkling2 EXL3 experts capture at most {GRAPH_TOKENS} tokens per step "
+                               f"(got {T}); lower max_cudagraph_capture_size or raise VLLM_QUANTPACK_INKLING2_GRAPH_TOKENS")
+        return self.compute_loop(x, ids, gammas)
+
+    def compute_indexed(self, x, ids, gammas):
+        """Few tokens (decode, MTP verification): one slot per (token, expert) assignment in exllamav3's indexed
+        multi-matrix GEMM, which reads the expert ids on the GPU. No CPU synchronisation -> CUDA-graph capturable.
+        exl3_moe cannot be used: it has no softcapped activation."""
+        from exllamav3.ext import exllamav3_ext as ext
+        T, k = ids.shape
+        S, H, dev = T * k, self.hidden_size, x.device
+        idx = ids.reshape(1, S).long()                       # -1 (padding / not local) skips the slot
+        xs = x.half().index_select(0, torch.arange(T, device=dev).repeat_interleave(k)).view(S, 1, H)
+        g = torch.zeros((S, 1, self.gate.oc), dtype=torch.float, device=dev)
+        u = torch.zeros_like(g)
+        had = torch.empty((S, 1, max(H, self.gate.oc)), dtype=torch.half, device=dev)
+        for p, out in ((self.gate, g), (self.up, u)):
+            ext.exl3_mgemm(xs, p.p_trellis, out, p.p_suh, had, p.p_svh, idx, None, float(p.K), -1, p.mcg, p.mul1,
+                           -1, -1, 0, 1)
+        a = softcapped_swiglu(g, u, self.gate_cap, self.up_cap).half()
+        # weighted reduction: each token's run of k slots is scaled by its gammas and summed into out[token]
+        w = (gammas.reshape(1, S).float() * (idx >= 0)).half()
+        out = torch.zeros((S, 1, H), dtype=torch.float, device=dev)
+        d = self.down
+        ext.exl3_mgemm(a, d.p_trellis, out, d.p_suh, had, d.p_svh, idx, w, float(d.K), -1, d.mcg, d.mul1,
+                       -1, -1, 0, T)
+        return out[:T, 0].to(x.dtype)
+
+    def compute_loop(self, x, ids, gammas):
+        """Many tokens (prefill, eager): one EXL3 GEMM per active expert; bincount syncs with the CPU."""
         T, k = ids.shape
         y = x.half().contiguous()
         flat_e = ids.reshape(-1).long()
