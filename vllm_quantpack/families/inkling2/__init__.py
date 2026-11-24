@@ -14,6 +14,8 @@ def register(logger):
             return False
     except ModuleNotFoundError:
         return False
+    from . import ampere
+    ampere.install(logger)        # before any vllm.models.inkling2 module is imported
     from vllm import ModelRegistry
     from vllm.models.inkling2.quant_config import Inkling2QuantConfig
 
